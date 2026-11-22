@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Install', 'PrepareOnline', 'Activate', 'Uninstall')]
+    [ValidateSet('Install', 'PrepareOnline', 'Activate', 'ConfigureProxy', 'ClearProxy', 'Uninstall')]
     [string]$Mode,
     [Parameter(Mandatory = $true)]
     [string]$MsiPath,
@@ -11,6 +11,8 @@ param(
     [string]$OutputFile,
     [Parameter(Mandatory = $false)]
     [string]$CancelFile = '',
+    [Parameter(Mandatory = $false)]
+    [string]$ProxyUrl = '',
     [Parameter(Mandatory = $false)]
     [switch]$ForceRepair
 )
@@ -700,11 +702,99 @@ function Test-FunnelCapability([string]$Cli) {
     }
 }
 
+function Backup-TailscaleServiceEnvironment {
+    if (-not (Test-Path -LiteralPath $StateFile -PathType Leaf)) {
+        $dir = Split-Path -Parent $StateFile
+        if ($dir) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Set-Content -LiteralPath $StateFile -Value '' -Encoding ASCII
+    }
+
+    $stateText = Get-Content -LiteralPath $StateFile -Raw
+    if ($stateText -match '(?m)^PreviousServiceEnvironmentSaved=1$') { return }
+
+    $existingEnv = @()
+    try {
+        $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\Tailscale', $false)
+        if ($regKey) {
+            try {
+                $val = $regKey.GetValue('Environment', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ($val -is [string[]]) { $existingEnv = $val }
+            }
+            finally { $regKey.Dispose() }
+        }
+    }
+    catch { }
+
+    $encoded = if ($existingEnv.Count -gt 0) {
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($existingEnv -join "`n")))
+    } else { '' }
+
+    Add-Content -LiteralPath $StateFile -Value 'PreviousServiceEnvironmentSaved=1' -Encoding ASCII
+    Add-Content -LiteralPath $StateFile -Value ('PreviousServiceEnvironmentBase64=' + $encoded) -Encoding ASCII
+}
+
+function Set-TailscaleServiceProxy([string]$TargetProxyUrl) {
+    if ([string]::IsNullOrWhiteSpace($TargetProxyUrl)) {
+        throw 'Не указан ProxyUrl для настройки службы Tailscale.'
+    }
+    Backup-TailscaleServiceEnvironment
+
+    $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\Tailscale', $true)
+    if (-not $regKey) { throw 'Ключ реестра службы Tailscale не найден.' }
+    try {
+        $current = @()
+        $raw = $regKey.GetValue('Environment', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($raw -is [string[]]) { $current = $raw }
+
+        $filtered = @($current | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and
+            $_ -notmatch '^(?i)(HTTP_PROXY|HTTPS_PROXY|NO_PROXY)='
+        })
+        $next = @(
+            $filtered + @(
+                ('HTTP_PROXY=' + $TargetProxyUrl),
+                ('HTTPS_PROXY=' + $TargetProxyUrl),
+                'NO_PROXY=127.0.0.1,localhost,::1'
+            )
+        )
+        $regKey.SetValue('Environment', [string[]]$next, [Microsoft.Win32.RegistryValueKind]::MultiString)
+    }
+    finally {
+        $regKey.Dispose()
+    }
+
+    Stop-TailscaleService
+    Wait-Service 'Running' 30
+}
+
+function Restore-TailscaleServiceEnvironment([string]$StateText) {
+    if ($StateText -notmatch '(?m)^PreviousServiceEnvironmentSaved=1$') { return }
+    $encoded = [regex]::Match($StateText, '(?m)^PreviousServiceEnvironmentBase64=(.*)$').Groups[1].Value.Trim()
+
+    $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\Tailscale', $true)
+    if (-not $regKey) { return }
+    try {
+        if ([string]::IsNullOrWhiteSpace($encoded)) {
+            $regKey.DeleteValue('Environment', $false)
+        }
+        else {
+            $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
+            $lines = @($decoded -split "`n" | Where-Object { $_ -ne '' })
+            $regKey.SetValue('Environment', [string[]]$lines, [Microsoft.Win32.RegistryValueKind]::MultiString)
+        }
+    }
+    finally {
+        $regKey.Dispose()
+    }
+}
+
 function Restore-PreexistingTailscale([string]$StateText) {
     $paths = Get-TailscalePaths
     if (-not (Test-Path -LiteralPath $paths.Cli -PathType Leaf)) {
         throw 'Не найден tailscale.exe для восстановления исходных настроек.'
     }
+
+    Restore-TailscaleServiceEnvironment $StateText
 
     $previousAcceptDns = [regex]::Match($StateText, '(?m)^PreviousAcceptDns=(true|false)$').Groups[1].Value
     $previousUnattended = [regex]::Match($StateText, '(?m)^PreviousUnattended=(true|false)$').Groups[1].Value
@@ -926,6 +1016,27 @@ try {
             throw 'Служба Tailscale остановлена. Повторите подключение, чтобы Hotplug запустил её с нужными правами.'
         }
 
+        $liveStatusResult = Invoke-TailscaleCommand $paths.Cli 'status --json' 6
+        if ($liveStatusResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($liveStatusResult.StandardOutput)) {
+            try {
+                $liveJson = $liveStatusResult.StandardOutput | ConvertFrom-Json -ErrorAction Stop
+                $healthList = @($liveJson.Health | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+                $fatalHealth = $healthList | Where-Object {
+                    [string]$_ -match '(?i)coordination server|not connected|no derp|unable to connect|tailscale is stopped|logged out'
+                } | Select-Object -First 1
+
+                if ([string]$liveJson.BackendState -eq 'Running' -and ($liveJson.Self.Online -ne $true -or $fatalHealth)) {
+                    $reasonText = if ($fatalHealth) { [string]$fatalHealth } else { 'Демон Tailscale не в сети (Self.Online=false).' }
+                    Write-Result @(
+                        'Connected=0',
+                        ('Status=' + $reasonText)
+                    )
+                    exit 12
+                }
+            }
+            catch { }
+        }
+
         $ipOutput = & $paths.Cli ip -4 2>&1
         $ipExit = $LASTEXITCODE
         $ipAddress = [string]($ipOutput | Select-Object -First 1)
@@ -1046,6 +1157,25 @@ try {
             'FunnelAuthorized=1',
             'FunnelStatusVerified=1'
         )
+        exit 0
+    }
+
+    if ($Mode -eq 'ConfigureProxy') {
+        Set-TailscaleServiceProxy -TargetProxyUrl $ProxyUrl
+        Write-Result @(
+            'ProxyConfigured=1',
+            ('ProxyUrl=' + $ProxyUrl),
+            'Service=Running'
+        )
+        exit 0
+    }
+
+    if ($Mode -eq 'ClearProxy') {
+        $stateText = if (Test-Path -LiteralPath $StateFile -PathType Leaf) { Get-Content -LiteralPath $StateFile -Raw } else { '' }
+        Restore-TailscaleServiceEnvironment $stateText
+        Stop-TailscaleService
+        Wait-Service 'Running' 30
+        Write-Result @('ProxyCleared=1', 'Service=Running')
         exit 0
     }
 

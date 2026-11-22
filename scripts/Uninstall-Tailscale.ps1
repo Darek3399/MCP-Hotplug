@@ -177,6 +177,27 @@ if ($installedByBridge) {
     Remove-Item -LiteralPath $managedMsiPath -Force -ErrorAction SilentlyContinue
 }
 else {
+    if ($stateText -match '(?m)^PreviousServiceEnvironmentSaved=1$') {
+        $envEncoded = [regex]::Match($stateText, '(?m)^PreviousServiceEnvironmentBase64=(.*)$').Groups[1].Value.Trim()
+        try {
+            $envRegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\Tailscale', $true)
+            if ($envRegKey) {
+                try {
+                    if ([string]::IsNullOrWhiteSpace($envEncoded)) {
+                        $envRegKey.DeleteValue('Environment', $false)
+                    }
+                    else {
+                        $envDecoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($envEncoded))
+                        $envLines = @($envDecoded -split "`n" | Where-Object { $_ -ne '' })
+                        $envRegKey.SetValue('Environment', [string[]]$envLines, [Microsoft.Win32.RegistryValueKind]::MultiString)
+                    }
+                }
+                finally { $envRegKey.Dispose() }
+            }
+        }
+        catch { }
+    }
+
     $previousAcceptDns = [regex]::Match($stateText, '(?m)^PreviousAcceptDns=(true|false)$').Groups[1].Value
     $previousUnattended = [regex]::Match($stateText, '(?m)^PreviousUnattended=(true|false)$').Groups[1].Value
 

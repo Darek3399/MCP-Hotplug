@@ -1,9 +1,12 @@
 using System;
-using System.Diagnostics;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
+using System.Linq;
+using System.Net.NetworkInformation;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Linq;
+using Microsoft.Win32;
 using McpHotplug.Models;
 
 namespace McpHotplug.Services;
@@ -13,6 +16,7 @@ public enum TailscaleConnectionPhase
     Offline,
     Disconnected,
     Connecting,
+    Reconnecting,
     Disconnecting,
     WaitingForLogin,
     WaitingForDeviceApproval,
@@ -23,18 +27,15 @@ public enum TailscaleConnectionPhase
     Error
 }
 
-/// <summary>
-/// Single in-process owner of the Tailscale/Funnel connection lifecycle.
-/// The UI talks only to this manager; it does not query Tailscale directly.
-/// No Tailscale process or status polling is started until online access is enabled.
-/// </summary>
 public sealed class TailscaleConnectionManager : IDisposable
 {
     private static readonly TimeSpan ConnectionTimeout = TimeSpan.FromMinutes(4);
-    private static readonly TimeSpan RetryInterval = TimeSpan.FromSeconds(3);
-    private static readonly TimeSpan MonitorInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan SetupRetryInterval = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan RecoveryCheckInterval = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan OnlineLocalHealthInterval = TimeSpan.FromSeconds(10);
 
     private readonly TailscaleService _service = new();
+    private readonly TailscaleSmartRelay _relay = new();
     private readonly AppSettings _settings;
     private readonly Func<bool> _saveSettings;
     private readonly SemaphoreSlim _operationGate = new(1, 1);
@@ -45,6 +46,10 @@ public sealed class TailscaleConnectionManager : IDisposable
     private CancellationTokenSource? _activeConnection;
     private TailscaleConnectionPhase _phase;
     private string _statusText;
+    private TailscaleRoute? _activeRoute;
+    private DateTime _lastRouteVerifiedUtc = DateTime.MinValue;
+    private DateTime _lastFailureClassificationUtc = DateTime.MinValue;
+    private bool _proxyElevationDeclinedInSession;
     private bool _gatewayReady;
     private bool _started;
     private bool _busy;
@@ -60,13 +65,32 @@ public sealed class TailscaleConnectionManager : IDisposable
         _saveSettings = saveSettings ?? throw new ArgumentNullException(nameof(saveSettings));
         _service.StatusChanged += Service_StatusChanged;
         _service.FunnelAuthorizationRequired += Service_FunnelAuthorizationRequired;
+        _relay.RouteFailureDetected += Relay_RouteFailureDetected;
+
+        NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+
+        // If the Windows Tailscale service is already configured to use our local Smart-Relay,
+        // start it immediately so even an inactive Funnel profile never breaks the service's network.
+        // Only prewarm in background when Funnel auto-connect is disabled; otherwise ReconcileAsync
+        // handles route selection under _operationGate without racing or aborting active tunnels.
+        if (TailscaleService.IsServiceProxyConfiguredForRelay())
+        {
+            try
+            {
+                _relay.EnsureStarted();
+                if (!_settings.TailscaleFunnelEnabled)
+                    _ = PrewarmRelayRouteAsync(_lifetimeCancellation.Token);
+            }
+            catch (Exception ex) { ErrorLog.Write("TailscaleRelay.Startup", ex); }
+        }
 
         if (_settings.TailscaleFunnelEnabled)
         {
             _phase = TailscaleConnectionPhase.Offline;
             _statusText = I18n.Tr(
-                "ОФЛАЙН · Онлайн-доступ настроен, но туннель сейчас недоступен.",
-                "OFFLINE · Online access is configured, but the tunnel is currently unavailable.");
+                "ОФЛАЙН · Онлайн-доступ настроен, выполняется проверка подключения…",
+                "OFFLINE · Online access is configured, verifying connection…");
         }
         else if (_service.IsInitialSetupComplete)
         {
@@ -86,30 +110,14 @@ public sealed class TailscaleConnectionManager : IDisposable
 
     public event EventHandler? StatusChanged;
 
-    public TailscaleConnectionPhase Phase
-    {
-        get { lock (_sync) return _phase; }
-    }
-
-    public string StatusText
-    {
-        get { lock (_sync) return _statusText; }
-    }
-
-    public string? PublicUrl => _service.PublicUrl;
-    public bool IsConnected => _service.IsPublished;
+    public TailscaleConnectionPhase Phase { get { lock (_sync) return _phase; } }
+    public string StatusText { get { lock (_sync) return _statusText; } }
+    public string? PublicUrl => IsConnected ? _service.PublicUrl : null;
+    public bool IsConnected => Phase == TailscaleConnectionPhase.Connected && _service.IsPublished;
     public bool IsEnabled => _settings.TailscaleFunnelEnabled;
     public bool IsInitialSetupComplete => _service.IsInitialSetupComplete;
+    public bool IsBusy { get { lock (_sync) return _busy; } }
 
-    public bool IsBusy
-    {
-        get { lock (_sync) return _busy; }
-    }
-
-    /// <summary>
-    /// Called once by Hotplug after its local MCP gateway has initialized.
-    /// A disabled/offline profile returns without invoking Tailscale or CLI checks.
-    /// </summary>
     public void Start(bool gatewayReady)
     {
         ThrowIfDisposed();
@@ -136,14 +144,9 @@ public sealed class TailscaleConnectionManager : IDisposable
             return;
         }
 
-        StartMonitor();
-        _ = ReconcileAsync(_lifetimeCancellation.Token);
+        ScheduleMonitor(TimeSpan.Zero);
     }
 
-    /// <summary>
-    /// Hotplug reports only local gateway availability. This method never probes Tailscale
-    /// when the user has not enabled online access.
-    /// </summary>
     public void NotifyGatewayAvailability(bool ready)
     {
         if (_disposed || _shutdownStarted || _gatewayReady == ready)
@@ -161,10 +164,7 @@ public sealed class TailscaleConnectionManager : IDisposable
         }
 
         if (IsInitialSetupComplete)
-        {
-            StartMonitor();
-            _ = ReconcileAsync(_lifetimeCancellation.Token);
-        }
+            ScheduleMonitor(TimeSpan.FromMilliseconds(500));
     }
 
     public async Task ToggleConnectionAsync()
@@ -174,12 +174,8 @@ public sealed class TailscaleConnectionManager : IDisposable
 
         bool busy;
         lock (_sync) busy = _busy;
-        if (busy)
-            return;
+        if (busy) return;
 
-        // Once the first setup is complete, an enabled online profile means the user
-        // intends to keep Funnel enabled—even while temporarily offline or recovering.
-        // Allow the single toggle to disable that intent after a connection failure.
         if (IsConnected || (_settings.TailscaleFunnelEnabled && IsInitialSetupComplete))
             await DisconnectAsync();
         else
@@ -194,6 +190,8 @@ public sealed class TailscaleConnectionManager : IDisposable
         _shutdownStarted = true;
         _lifetimeCancellation.Cancel();
         StopMonitor();
+        UnsubscribeSystemEvents();
+
         CancellationTokenSource? activeConnection;
         lock (_sync) activeConnection = _activeConnection;
         activeConnection?.Cancel();
@@ -201,31 +199,15 @@ public sealed class TailscaleConnectionManager : IDisposable
         var acquired = await _operationGate.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         if (!acquired)
         {
-            // If the active operation did not release its gate after cancellation,
-            // remove only the Hotplug-owned public route before killing its process.
-            try { await _service.DisableManagedFunnelBestEffortAsync().ConfigureAwait(false); }
-            catch { }
-
-            _service.StatusChanged -= Service_StatusChanged;
-            _service.FunnelAuthorizationRequired -= Service_FunnelAuthorizationRequired;
-            _service.Dispose();
-            _disposed = true;
+            try { await _service.DisableManagedFunnelBestEffortAsync().ConfigureAwait(false); } catch { }
+            CleanupOwnedResources();
             return;
         }
 
         try
         {
-            try
-            {
-                await _service.StopHostingAsync().ConfigureAwait(false);
-            }
-            finally
-            {
-                _service.StatusChanged -= Service_StatusChanged;
-                _service.FunnelAuthorizationRequired -= Service_FunnelAuthorizationRequired;
-                _service.Dispose();
-                _disposed = true;
-            }
+            try { await _service.StopHostingAsync().ConfigureAwait(false); }
+            finally { CleanupOwnedResources(); }
         }
         finally
         {
@@ -238,6 +220,9 @@ public sealed class TailscaleConnectionManager : IDisposable
         if (!await _operationGate.WaitAsync(0))
             return;
 
+        _proxyElevationDeclinedInSession = false;
+        StopMonitor();
+
         var cancellation = new CancellationTokenSource();
         lock (_sync)
         {
@@ -248,7 +233,41 @@ public sealed class TailscaleConnectionManager : IDisposable
 
         try
         {
-            await RunConnectionFlowAsync(cancellation.Token);
+            // Persist user's intent to stay connected if initial setup is already complete,
+            // so transient network errors automatically trigger the 10s recovery timer.
+            if (IsInitialSetupComplete && !_settings.TailscaleFunnelEnabled)
+            {
+                _settings.TailscaleFunnelEnabled = true;
+                _saveSettings();
+            }
+
+            SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
+                "ПОДКЛЮЧЕНИЕ · Проверяю состояние Tailscale…",
+                "CONNECTING · Checking Tailscale status…"));
+            var clientTask = _service.LaunchClientAsync(cancellation.Token);
+            var liveTask = _service.GetLiveStatusAsync(cancellation.Token);
+            await Task.WhenAll(clientTask, liveTask);
+
+            var liveNow = liveTask.Result;
+            var relayConfigured = TailscaleService.IsServiceProxyConfiguredForRelay();
+            if (liveNow.IsTailnetOnline && (!relayConfigured || _relay.IsRunning))
+            {
+                // Daemon is already online on the active route: do NOT re-race or tear down its live tunnels!
+                if (_activeRoute == null)
+                {
+                    _activeRoute = relayConfigured ? _relay.CurrentRoute : TailscaleRoute.Direct;
+                    _lastRouteVerifiedUtc = DateTime.UtcNow;
+                }
+            }
+            else
+            {
+                SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
+                    "ПОДКЛЮЧЕНИЕ · Подбираю рабочий маршрут к Tailscale…",
+                    "CONNECTING · Probing best route to Tailscale…"));
+                await EnsureRouteAndRelayReadyAsync(allowElevation: true, forceClassify: true, cancellation.Token);
+            }
+
+            await RunConnectionFlowAsync(allowElevation: true, cancellation.Token, prelaunchedClientAlreadyRunning: clientTask.Result);
             cancellation.Token.ThrowIfCancellationRequested();
 
             var previousEnabled = _settings.TailscaleFunnelEnabled;
@@ -261,7 +280,6 @@ public sealed class TailscaleConnectionManager : IDisposable
                     "Could not save the online access setting. Check write permissions for the Config folder."));
             }
 
-            StartMonitor();
             if (!_gatewayReady)
             {
                 SetStatus(TailscaleConnectionPhase.WaitingForGateway, I18n.Tr(
@@ -274,21 +292,14 @@ public sealed class TailscaleConnectionManager : IDisposable
                 "Запускаю публичный HTTPS-туннель…",
                 "Starting the public HTTPS tunnel…"));
             cancellation.Token.ThrowIfCancellationRequested();
-            await _service.StartHostingAsync(cancellation.Token);
-            SetStatus(TailscaleConnectionPhase.Connected, I18n.Tr(
-                "ПОДКЛЮЧЕНО · Публичный HTTPS-туннель активен.",
-                "CONNECTED · Public HTTPS tunnel is active."));
-            ErrorLog.LogConnection(I18n.Tr(
-                "Tailscale Funnel активен: " + (_service.PublicUrl ?? string.Empty),
-                "Tailscale Funnel is active: " + (_service.PublicUrl ?? string.Empty)));
-            StartMonitor();
+            await _service.StartHostingAsync(_activeRoute ?? TailscaleRoute.Direct, cancellation.Token);
+            SetStatus(TailscaleConnectionPhase.Connected, BuildConnectedStatusText());
+            ScheduleMonitor(OnlineLocalHealthInterval);
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
             try { await _service.StopHostingAsync(); } catch { }
-            var phase = IsInitialSetupComplete
-                ? TailscaleConnectionPhase.Disconnected
-                : TailscaleConnectionPhase.Offline;
+            var phase = IsInitialSetupComplete ? TailscaleConnectionPhase.Disconnected : TailscaleConnectionPhase.Offline;
             SetStatus(phase, I18n.Tr("ПОДКЛЮЧЕНИЕ ОТМЕНЕНО.", "CONNECTION CANCELED."));
         }
         catch (Exception exception)
@@ -296,6 +307,9 @@ public sealed class TailscaleConnectionManager : IDisposable
             SetStatus(TailscaleConnectionPhase.Error,
                 I18n.Tr("ОШИБКА ПОДКЛЮЧЕНИЯ · ", "CONNECTION ERROR · ") + exception.Message);
             ErrorLog.Write("TailscaleConnectionManager.Connect", exception);
+            // If online access is already enabled by user, keep retrying every 10s automatically.
+            if (_settings.TailscaleFunnelEnabled && IsInitialSetupComplete && _gatewayReady)
+                ScheduleMonitor(RecoveryCheckInterval);
         }
         finally
         {
@@ -311,7 +325,120 @@ public sealed class TailscaleConnectionManager : IDisposable
         }
     }
 
-    private async Task RunConnectionFlowAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Races Direct vs all system/env HTTP & SOCKS5 proxies against controlplane.tailscale.com.
+    /// Automatically switches Smart-Relay route and configures the Windows Tailscale service once if needed.
+    /// </summary>
+    private async Task PrewarmRelayRouteAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var probe = await TailscaleNetworkProbe
+                .RaceBestRouteAsync(preferredRoute: null, classifyOnFailure: false, cancellationToken)
+                .ConfigureAwait(false);
+            if (!probe.Success || probe.WinningRoute == null || _disposed || _shutdownStarted)
+                return;
+
+            // Never override _activeRoute or abort tunnels if ConnectAsync / ReconcileAsync is running.
+            if (!await _operationGate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+                return;
+            try
+            {
+                if (_disposed || _shutdownStarted || _activeRoute != null)
+                    return;
+
+                var winner = probe.WinningRoute;
+                _activeRoute = winner;
+                _lastRouteVerifiedUtc = DateTime.UtcNow;
+                if (_relay.IsRunning)
+                    _relay.SetRoute(winner, abortExistingTunnels: true);
+            }
+            finally
+            {
+                _operationGate.Release();
+            }
+        }
+        catch { }
+    }
+
+    private async Task<TailscaleRouteProbeResult> EnsureRouteAndRelayReadyAsync(
+        bool allowElevation,
+        bool forceClassify,
+        CancellationToken cancellationToken,
+        ISet<string>? excludedRouteKeys = null)
+    {
+        var hasExclusions = excludedRouteKeys != null && excludedRouteKeys.Count > 0;
+        var cachedRoute = _activeRoute;
+        if (!forceClassify && !hasExclusions && cachedRoute != null &&
+            DateTime.UtcNow - _lastRouteVerifiedUtc < TimeSpan.FromSeconds(15))
+        {
+            var relayReady = TailscaleService.IsServiceProxyConfiguredForRelay();
+            if (relayReady || cachedRoute.Kind == TailscaleRouteKind.Direct)
+            {
+                return new TailscaleRouteProbeResult
+                {
+                    Success = true,
+                    WinningRoute = cachedRoute,
+                    DiagnosticMessage = $"Using freshly verified route {cachedRoute}."
+                };
+            }
+        }
+
+        var preferred = (cachedRoute != null && (!hasExclusions || !excludedRouteKeys!.Contains(cachedRoute.Key)))
+            ? cachedRoute
+            : null;
+        var shouldClassify = forceClassify || (DateTime.UtcNow - _lastFailureClassificationUtc >= TimeSpan.FromSeconds(25));
+        var probe = await TailscaleNetworkProbe
+            .RaceBestRouteAsync(preferred, shouldClassify, cancellationToken, excludedRouteKeys)
+            .ConfigureAwait(false);
+
+        if (!probe.Success || probe.WinningRoute == null)
+        {
+            if (shouldClassify) _lastFailureClassificationUtc = DateTime.UtcNow;
+            throw new InvalidOperationException(probe.UserMessage);
+        }
+
+        var winner = probe.WinningRoute;
+        var previousRoute = _activeRoute;
+        _activeRoute = winner;
+        _lastRouteVerifiedUtc = DateTime.UtcNow;
+
+        var serviceUsesRelay = TailscaleService.IsServiceProxyConfiguredForRelay();
+        if (serviceUsesRelay || winner.Kind != TailscaleRouteKind.Direct)
+        {
+            _relay.EnsureStarted();
+            _relay.SetRoute(winner, abortExistingTunnels: !winner.Equals(previousRoute));
+        }
+
+        if (winner.Kind != TailscaleRouteKind.Direct && !serviceUsesRelay)
+        {
+            if (!allowElevation || _proxyElevationDeclinedInSession)
+            {
+                throw new InvalidOperationException(I18n.Tr(
+                    $"Найден рабочий маршрут ({winner.DisplayName}), но для его подключения к службе Tailscale требуется однократное подтверждение прав администратора (нажмите «Подключить»).",
+                    $"Working route found ({winner.DisplayName}), but one-time administrator confirmation is required to route the Tailscale service (click Connect)."));
+            }
+
+            try
+            {
+                await _service.EnsureServiceProxyConfiguredAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsElevationCanceled(ex))
+            {
+                _proxyElevationDeclinedInSession = true;
+                throw new InvalidOperationException(I18n.Tr(
+                    "Запрос прав администратора отменён. Без однократной настройки прокси служба Tailscale не сможет использовать VPN в режиме прокси.",
+                    "Administrator prompt was canceled. Without one-time proxy setup, the Tailscale service cannot use system-proxy VPN."));
+            }
+        }
+
+        return probe;
+    }
+
+    private async Task RunConnectionFlowAsync(
+        bool allowElevation,
+        CancellationToken cancellationToken,
+        bool? prelaunchedClientAlreadyRunning = null)
     {
         lock (_sync)
         {
@@ -320,38 +447,31 @@ public sealed class TailscaleConnectionManager : IDisposable
         }
         var deadline = DateTime.UtcNow.Add(ConnectionTimeout);
 
-        // Windows Tailscale consists of a machine service and a per-user tray
-        // client. Ensure the current user session has the client before polling
-        // the daemon; otherwise the service can remain in NoState indefinitely.
-        SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
-            "ЗАПУСК · Проверяю клиент Tailscale в системном трее…",
-            "STARTING · Checking the Tailscale system-tray client…"));
-        var clientAlreadyRunning = await _service.LaunchClientAsync(cancellationToken);
-        SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
-            clientAlreadyRunning
-                ? "ПРОВЕРКА · Клиент Tailscale уже запущен. Проверяю состояние устройства…"
-                : "ЗАПУСК · Клиент Tailscale запущен. Проверяю состояние устройства…",
-            clientAlreadyRunning
-                ? "CHECKING · The Tailscale client is already running. Checking device state…"
-                : "STARTING · The Tailscale client has been started. Checking device state…"));
+        bool clientAlreadyRunning;
+        if (prelaunchedClientAlreadyRunning.HasValue)
+        {
+            clientAlreadyRunning = prelaunchedClientAlreadyRunning.Value;
+        }
+        else
+        {
+            SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
+                "ЗАПУСК · Проверяю клиент Tailscale в системном трее…",
+                "STARTING · Checking the Tailscale system-tray client…"));
+            clientAlreadyRunning = await _service.LaunchClientAsync(cancellationToken);
+        }
 
         var loginUrlOpened = string.Empty;
         var loginRequestAttempted = false;
         var pendingSince = DateTime.MinValue;
+        var offlineSince = DateTime.MinValue;
+        var currentRouteOfflineSince = DateTime.MinValue;
+        var wakeAttemptedForCurrentRoute = false;
+        var failedTailnetRouteKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var deviceApprovalPageOpened = false;
-        var firstCheck = true;
 
         while (DateTime.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (firstCheck)
-            {
-                SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
-                    "ПРОВЕРКА · Проверяю состояние Tailscale…",
-                    "CHECKING · Checking Tailscale state…"));
-                firstCheck = false;
-            }
-
             var result = await _service.CheckConnectionAsync(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -359,39 +479,98 @@ public sealed class TailscaleConnectionManager : IDisposable
                 return;
 
             var details = result.Details ?? string.Empty;
-            if (details.StartsWith("DEVICE_LOGIN_REQUIRED|", StringComparison.Ordinal))
+
+            if (details.StartsWith("TAILNET_OFFLINE|", StringComparison.Ordinal))
+            {
+                var now = DateTime.UtcNow;
+                var firstOfflinePoll = offlineSince == DateTime.MinValue;
+                if (firstOfflinePoll)
+                {
+                    offlineSince = now;
+                    currentRouteOfflineSince = now;
+                }
+                var msg = details.Substring("TAILNET_OFFLINE|".Length).Trim();
+
+                var routeLabel = (_activeRoute ?? TailscaleRoute.Direct).DisplayName;
+                SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
+                    $"ПОДКЛЮЧЕНИЕ · Вывожу Tailscale в сеть ({routeLabel})…",
+                    $"CONNECTING · Bringing Tailscale online ({routeLabel})…"));
+
+                // Give tailscaled enough time to complete down->up + PollNetMap on a clean route (12s)
+                // before demoting the route and failing over to another candidate.
+                var failoverWindow = _activeRoute != null &&
+                    (_activeRoute.Kind == TailscaleRouteKind.HttpProxy ||
+                     _activeRoute.Kind == TailscaleRouteKind.Socks5Proxy ||
+                     _activeRoute.Kind == TailscaleRouteKind.Direct)
+                    ? TimeSpan.FromSeconds(12)
+                    : TimeSpan.FromSeconds(6);
+
+                var shouldFailoverRoute = !firstOfflinePoll &&
+                    _activeRoute != null &&
+                    (now - currentRouteOfflineSince >= failoverWindow);
+
+                if (shouldFailoverRoute)
+                {
+                    failedTailnetRouteKeys.Add(_activeRoute!.Key);
+                    var probe = await EnsureRouteAndRelayReadyAsync(
+                        allowElevation,
+                        forceClassify: false,
+                        cancellationToken,
+                        failedTailnetRouteKeys).ConfigureAwait(false);
+                    currentRouteOfflineSince = DateTime.UtcNow;
+                    wakeAttemptedForCurrentRoute = false;
+                    if (probe.Success && _relay.IsRunning)
+                        _relay.AbortActiveTunnels();
+                }
+                else if (firstOfflinePoll)
+                {
+                    var probe = await EnsureRouteAndRelayReadyAsync(
+                        allowElevation,
+                        forceClassify: false,
+                        cancellationToken,
+                        failedTailnetRouteKeys).ConfigureAwait(false);
+                    if (probe.Success && _relay.IsRunning)
+                        _relay.AbortActiveTunnels();
+                }
+
+                // Give tailscaled 1.2s to reconnect naturally after AbortActiveTunnels before forcing down->up.
+                if (!wakeAttemptedForCurrentRoute && (now - currentRouteOfflineSince >= TimeSpan.FromMilliseconds(1200)))
+                {
+                    wakeAttemptedForCurrentRoute = true;
+                    await _service.WakeDaemonReconnectAsync(cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+                    continue;
+                }
+
+                if (DateTime.UtcNow - offlineSince >= TimeSpan.FromSeconds(35))
+                    throw new TimeoutException(msg);
+
+                await Task.Delay(TimeSpan.FromMilliseconds(900), cancellationToken);
+                continue;
+            }
+            else if (details.StartsWith("DEVICE_LOGIN_REQUIRED|", StringComparison.Ordinal))
             {
                 pendingSince = DateTime.MinValue;
+                offlineSince = DateTime.MinValue;
                 var payload = details.Substring("DEVICE_LOGIN_REQUIRED|".Length);
                 var separator = payload.IndexOfAny(new[] { '\r', '\n' });
                 var authUrl = separator >= 0 ? payload.Substring(0, separator).Trim() : payload.Trim();
 
-                if (string.IsNullOrWhiteSpace(authUrl) &&
-                    string.IsNullOrWhiteSpace(loginUrlOpened) &&
-                    !loginRequestAttempted)
+                if (string.IsNullOrWhiteSpace(authUrl) && string.IsNullOrWhiteSpace(loginUrlOpened) && !loginRequestAttempted)
                 {
                     loginRequestAttempted = true;
                     SetStatus(TailscaleConnectionPhase.WaitingForLogin, I18n.Tr(
-                        "АВТОРИЗАЦИЯ · Получаю персональную ссылку для входа в аккаунт Tailscale…",
-                        "AUTHENTICATION · Requesting a device-specific Tailscale sign-in link…"));
-                    try
-                    {
-                        authUrl = await _service.BeginLoginAsync(cancellationToken);
-                    }
-                    catch (TimeoutException)
-                    {
-                        // If the CLI cannot produce an AuthURL, fall back to the
-                        // tray UI below instead of failing the whole connection flow.
-                        authUrl = string.Empty;
-                    }
+                        "АВТОРИЗАЦИЯ · Получаю ссылку для входа в аккаунт Tailscale…",
+                        "AUTHENTICATION · Requesting a Tailscale sign-in link…"));
+                    try { authUrl = await _service.BeginLoginAsync(cancellationToken); }
+                    catch (TimeoutException) { authUrl = string.Empty; }
                 }
                 else if (!string.IsNullOrWhiteSpace(authUrl))
                 {
                     loginRequestAttempted = true;
                 }
 
-                if (!string.IsNullOrWhiteSpace(authUrl) &&
-                    !string.Equals(authUrl, loginUrlOpened, StringComparison.Ordinal))
+                if (!string.IsNullOrWhiteSpace(authUrl) && !string.Equals(authUrl, loginUrlOpened, StringComparison.Ordinal))
                 {
                     if (!Uri.TryCreate(authUrl, UriKind.Absolute, out var loginUri) ||
                         !string.Equals(loginUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
@@ -400,117 +579,71 @@ public sealed class TailscaleConnectionManager : IDisposable
                     {
                         throw new InvalidOperationException("Tailscale вернул некорректную ссылку авторизации: " + authUrl);
                     }
-
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = loginUri.AbsoluteUri,
-                        UseShellExecute = true
-                    });
+                    Process.Start(new ProcessStartInfo { FileName = loginUri.AbsoluteUri, UseShellExecute = true });
                     loginUrlOpened = loginUri.AbsoluteUri;
                 }
+
                 SetStatus(TailscaleConnectionPhase.WaitingForLogin, string.IsNullOrWhiteSpace(loginUrlOpened)
-                    ? I18n.Tr(
-                        clientAlreadyRunning
-                            ? "ОЖИДАНИЕ ВХОДА · Клиент Tailscale уже запущен. Проверь стрелку скрытых значков трея. Если значка нет, открой Tailscale через меню Пуск и нажми Log in."
-                            : "ОЖИДАНИЕ ВХОДА · Открыл клиент Tailscale. Нажми Log in; если значок не виден, проверь скрытые значки трея.",
-                        clientAlreadyRunning
-                            ? "WAITING FOR SIGN-IN · The Tailscale client is already running. Check the system-tray overflow arrow. If the icon is not there, open Tailscale from the Start menu and select Log in."
-                            : "WAITING FOR SIGN-IN · Opened the Tailscale client. Select Log in; if the icon is not visible, check the hidden system-tray icons.")
-                    : I18n.Tr(
-                        "АВТОРИЗАЦИЯ · Открыл персональную ссылку Tailscale для входа и добавления этого устройства. После входа продолжу автоматически.",
-                        "AUTHENTICATION · Opened the device-specific Tailscale link to sign in and add this device. I will continue automatically."));
+                    ? I18n.Tr("ОЖИДАНИЕ ВХОДА · Войдите в аккаунт Tailscale из системного трея.", "WAITING FOR SIGN-IN · Sign in to Tailscale from the system tray.")
+                    : I18n.Tr("АВТОРИЗАЦИЯ · Открыл ссылку входа Tailscale. После входа продолжу автоматически.", "AUTHENTICATION · Opened Tailscale sign-in link. Will continue automatically."));
             }
             else if (details.StartsWith("DEVICE_STATE_PENDING|", StringComparison.Ordinal))
             {
-                if (pendingSince == DateTime.MinValue)
-                    pendingSince = DateTime.UtcNow;
-
-                var pendingFor = DateTime.UtcNow - pendingSince;
+                if (pendingSince == DateTime.MinValue) pendingSince = DateTime.UtcNow;
                 SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
-                    clientAlreadyRunning
-                        ? "ОЖИДАНИЕ · Клиент Tailscale уже запущен, но daemon остаётся в NoState. Проверь стрелку скрытых значков; если значка нет, открой Tailscale через меню Пуск."
-                        : "ОЖИДАНИЕ · Клиент Tailscale запущен, но daemon ещё не вышел из NoState.",
-                    clientAlreadyRunning
-                        ? "WAITING · The Tailscale client is already running, but the daemon remains in NoState. Check the tray overflow arrow; if the icon is absent, open Tailscale from the Start menu."
-                        : "WAITING · The Tailscale client has been started, but the daemon has not left NoState yet."));
-
-                if (pendingFor >= TimeSpan.FromSeconds(35))
-                {
-                    var diagnostic = details.Substring("DEVICE_STATE_PENDING|".Length).Trim();
-                    throw new TimeoutException(I18n.Tr(
-                        "Tailscale остаётся в состоянии NoState более 35 секунд. Проверь стрелку скрытых значков трея и наличие tailscale-ipn.exe. Если значка нет и процесса тоже нет, запусти Tailscale через меню Пуск.",
-                        "Tailscale remained in NoState for more than 35 seconds. Check the system-tray overflow arrow and whether tailscale-ipn.exe is running. If both are absent, launch Tailscale from the Start menu.") +
-                        (string.IsNullOrWhiteSpace(diagnostic) ? string.Empty : Environment.NewLine + diagnostic));
-                }
+                    "ОЖИДАНИЕ · Служба Tailscale инициализируется…",
+                    "WAITING · Tailscale daemon is initializing…"));
+                if (DateTime.UtcNow - pendingSince >= TimeSpan.FromSeconds(35))
+                    throw new TimeoutException(details.Substring("DEVICE_STATE_PENDING|".Length).Trim());
             }
             else if (details.StartsWith("DEVICE_NOT_CONNECTED|", StringComparison.Ordinal))
             {
-                if (pendingSince == DateTime.MinValue)
-                    pendingSince = DateTime.UtcNow;
-
-                var unconnectedFor = DateTime.UtcNow - pendingSince;
-
+                if (pendingSince == DateTime.MinValue) pendingSince = DateTime.UtcNow;
                 SetStatus(TailscaleConnectionPhase.WaitingForLogin, I18n.Tr(
                     clientAlreadyRunning
-                        ? "ОЖИДАНИЕ ПОДКЛЮЧЕНИЯ · Клиент Tailscale уже работает. Открой его из стрелки скрытых значков трея и нажми Connect. Если значка нет, запусти Tailscale через меню Пуск."
-                        : "ОЖИДАНИЕ ПОДКЛЮЧЕНИЯ · Открыл клиент Tailscale. Нажми Connect, если он этого требует.",
+                        ? "ОЖИДАНИЕ ПОДКЛЮЧЕНИЯ · Откройте Tailscale в трее и нажмите Connect."
+                        : "ОЖИДАНИЕ ПОДКЛЮЧЕНИЯ · Нажмите Connect в клиенте Tailscale.",
                     clientAlreadyRunning
-                        ? "WAITING FOR CONNECTION · The Tailscale client is already running. Open it from the tray overflow arrow and select Connect. If the icon is absent, launch Tailscale from the Start menu."
-                        : "WAITING FOR CONNECTION · Opened the Tailscale client. Select Connect if requested."));
-
-                if (unconnectedFor >= TimeSpan.FromSeconds(45))
-                {
-                    var diagnostic = details.Substring("DEVICE_NOT_CONNECTED|".Length).Trim();
-                    throw new TimeoutException(I18n.Tr(
-                        "Tailscale не выдал устройству адрес за 45 секунд. Проверь состояние Connect в клиенте Tailscale.",
-                        "Tailscale did not assign an IP address within 45 seconds. Check the Connect state in the Tailscale client.") +
-                        (string.IsNullOrWhiteSpace(diagnostic) ? string.Empty : Environment.NewLine + diagnostic));
-                }
+                        ? "WAITING FOR CONNECTION · Open Tailscale in the tray and select Connect."
+                        : "WAITING FOR CONNECTION · Select Connect in the Tailscale client."));
+                if (DateTime.UtcNow - pendingSince >= TimeSpan.FromSeconds(45))
+                    throw new TimeoutException(details.Substring("DEVICE_NOT_CONNECTED|".Length).Trim());
             }
             else if (details.StartsWith("DEVICE_APPROVAL_REQUIRED|", StringComparison.Ordinal))
             {
                 pendingSince = DateTime.MinValue;
                 if (!deviceApprovalPageOpened)
                 {
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = "https://console.tailscale.com/admin/machines",
-                        UseShellExecute = true
-                    });
+                    Process.Start(new ProcessStartInfo { FileName = "https://console.tailscale.com/admin/machines", UseShellExecute = true });
                     deviceApprovalPageOpened = true;
                 }
-
                 SetStatus(TailscaleConnectionPhase.WaitingForDeviceApproval, I18n.Tr(
-                    "ОДОБРЕНИЕ УСТРОЙСТВА · Подтвердите устройство в Tailscale Admin Console → Machines. Продолжу автоматически.",
-                    "DEVICE APPROVAL · Approve this device in Tailscale Admin Console → Machines. I will continue automatically."));
+                    "ОДОБРЕНИЕ УСТРОЙСТВА · Подтвердите устройство в Tailscale Admin Console → Machines.",
+                    "DEVICE APPROVAL · Approve this device in Tailscale Admin Console → Machines."));
             }
             else if (details.StartsWith("HTTPS_SETUP_REQUIRED|", StringComparison.Ordinal))
             {
                 pendingSince = DateTime.MinValue;
                 var payload = details.Substring("HTTPS_SETUP_REQUIRED|".Length);
-                var separator = payload.IndexOfAny(new[] { '\r', '\n' });
-                var httpsSetupUrl = separator >= 0 ? payload.Substring(0, separator).Trim() : payload.Trim();
-
-                if (!OpenHttpsSetupPage(httpsSetupUrl))
-                    throw new InvalidOperationException("Не удалось открыть или проверить ссылку включения HTTPS Tailscale.");
-
+                var sep = payload.IndexOfAny(new[] { '\r', '\n' });
+                var url = sep >= 0 ? payload.Substring(0, sep).Trim() : payload.Trim();
+                if (!OpenHttpsSetupPage(url))
+                    throw new InvalidOperationException("Не удалось открыть ссылку включения HTTPS Tailscale.");
                 SetStatus(TailscaleConnectionPhase.WaitingForHttpsSetup, I18n.Tr(
-                    "НАСТРОЙКА HTTPS · Открыл настройки HTTPS в Tailscale. Включите HTTPS-сертификаты; Hotplug продолжит проверку автоматически.",
-                    "HTTPS SETUP · Opened Tailscale HTTPS settings. Enable HTTPS certificates; Hotplug will continue checking automatically."));
+                    "НАСТРОЙКА HTTPS · Включите HTTPS-сертификаты в Tailscale. Продолжу автоматически.",
+                    "HTTPS SETUP · Enable HTTPS certificates in Tailscale. Will continue automatically."));
             }
             else if (details.StartsWith("FUNNEL_AUTHORIZATION_REQUIRED|", StringComparison.Ordinal))
             {
                 pendingSince = DateTime.MinValue;
                 var payload = details.Substring("FUNNEL_AUTHORIZATION_REQUIRED|".Length);
-                var separator = payload.IndexOfAny(new[] { '\r', '\n' });
-                var authorizationUrl = separator >= 0 ? payload.Substring(0, separator).Trim() : payload.Trim();
-
-                if (!OpenFunnelApprovalPage(authorizationUrl))
-                    throw new InvalidOperationException("Не удалось открыть или проверить ссылку отдельного разрешения Tailscale Funnel.");
-
+                var sep = payload.IndexOfAny(new[] { '\r', '\n' });
+                var url = sep >= 0 ? payload.Substring(0, sep).Trim() : payload.Trim();
+                if (!OpenFunnelApprovalPage(url))
+                    throw new InvalidOperationException("Не удалось открыть ссылку разрешения Tailscale Funnel.");
                 SetStatus(TailscaleConnectionPhase.WaitingForFunnelApproval, I18n.Tr(
-                    "РАЗРЕШЕНИЕ FUNNEL · Открыл отдельную страницу подтверждения Funnel. Нажмите Enable; Hotplug продолжит автоматически.",
-                    "FUNNEL APPROVAL · Opened the separate Funnel approval page. Select Enable; Hotplug will continue automatically."));
+                    "РАЗРЕШЕНИЕ FUNNEL · Нажмите Enable на открывшейся странице Tailscale. Продолжу автоматически.",
+                    "FUNNEL APPROVAL · Click Enable on the opened Tailscale page. Will continue automatically."));
             }
             else if (details.StartsWith("SETUP_FAILED|", StringComparison.Ordinal))
             {
@@ -521,12 +654,12 @@ public sealed class TailscaleConnectionManager : IDisposable
                 throw new InvalidOperationException(details);
             }
 
-            await Task.Delay(RetryInterval, cancellationToken);
+            await Task.Delay(SetupRetryInterval, cancellationToken);
         }
 
         throw new TimeoutException(I18n.Tr(
-            "Время ожидания подключения истекло. Нажмите «Подключить», чтобы повторить попытку.",
-            "Connection timed out. Select Connect to try again."));
+            "Время ожидания подключения истекло.",
+            "Connection timed out."));
     }
 
     private async Task DisconnectAsync()
@@ -539,8 +672,8 @@ public sealed class TailscaleConnectionManager : IDisposable
         try
         {
             SetStatus(TailscaleConnectionPhase.Disconnecting, I18n.Tr(
-                "ОТКЛЮЧЕНИЕ · Останавливаю только Funnel. Служба Tailscale останется подключённой…",
-                "DISCONNECTING · Stopping Funnel only. The Tailscale service will remain connected…"));
+                "ОТКЛЮЧЕНИЕ · Останавливаю Funnel…",
+                "DISCONNECTING · Stopping Funnel…"));
 
             var previousEnabled = _settings.TailscaleFunnelEnabled;
             _settings.TailscaleFunnelEnabled = false;
@@ -548,23 +681,21 @@ public sealed class TailscaleConnectionManager : IDisposable
             {
                 _settings.TailscaleFunnelEnabled = previousEnabled;
                 throw new InvalidOperationException(I18n.Tr(
-                    "Не удалось сохранить отключение онлайн-доступа. Проверьте права на папку Config.",
-                    "Could not save the online access setting. Check write permissions for the Config folder."));
+                    "Не удалось сохранить отключение онлайн-доступа.",
+                    "Could not save the online access setting."));
             }
 
+            // User explicitly disconnected -> completely stop the 10s recovery loop.
             StopMonitor();
             await _service.StopHostingAsync().ConfigureAwait(false);
             SetStatus(TailscaleConnectionPhase.Disconnected, I18n.Tr(
                 "ОТКЛЮЧЕНО · Локальный MCP Hotplug продолжает работать.",
                 "DISCONNECTED · Local MCP Hotplug remains available."));
-            ErrorLog.LogConnection(I18n.Tr(
-                "Tailscale Funnel отключён пользователем.",
-                "Tailscale Funnel disabled by user."));
+            ErrorLog.LogConnection(I18n.Tr("Tailscale Funnel отключён пользователем.", "Tailscale Funnel disabled by user."));
         }
         catch (Exception exception)
         {
-            SetStatus(TailscaleConnectionPhase.Error, I18n.Tr(
-                "ОШИБКА ОТКЛЮЧЕНИЯ · ", "DISCONNECT ERROR · ") + exception.Message);
+            SetStatus(TailscaleConnectionPhase.Error, I18n.Tr("ОШИБКА ОТКЛЮЧЕНИЯ · ", "DISCONNECT ERROR · ") + exception.Message);
             ErrorLog.Write("TailscaleConnectionManager.Disconnect", exception);
         }
         finally
@@ -575,18 +706,17 @@ public sealed class TailscaleConnectionManager : IDisposable
         }
     }
 
-    private void StartMonitor()
+    private void ScheduleMonitor(TimeSpan delay)
     {
-        if (_disposed || _shutdownStarted || !_settings.TailscaleFunnelEnabled || !_gatewayReady)
+        if (_disposed || _shutdownStarted || !_settings.TailscaleFunnelEnabled || !_gatewayReady || !IsInitialSetupComplete)
             return;
 
         lock (_sync)
         {
-            _monitorTimer ??= new Timer(
-                MonitorTimer_Tick,
-                null,
-                MonitorInterval,
-                MonitorInterval);
+            if (_monitorTimer == null)
+                _monitorTimer = new Timer(MonitorTimer_Tick, null, delay, Timeout.InfiniteTimeSpan);
+            else
+                _monitorTimer.Change(delay, Timeout.InfiniteTimeSpan);
         }
     }
 
@@ -605,95 +735,185 @@ public sealed class TailscaleConnectionManager : IDisposable
         _ = ReconcileAsync(_lifetimeCancellation.Token);
     }
 
+    /// <summary>
+    /// Single-flight background loop:
+    /// - While Online: performs ONLY a lightweight local daemon/funnel check (no external probes).
+    /// - When disconnected unexpectedly (user did NOT click Disconnect): immediately reflects offline/reconnecting
+    ///   state in UI and runs full route-race + recovery every 10 seconds until back online.
+    /// </summary>
     private async Task ReconcileAsync(CancellationToken cancellationToken)
     {
         if (_disposed || _shutdownStarted || cancellationToken.IsCancellationRequested ||
-            !_settings.TailscaleFunnelEnabled || !_gatewayReady ||
-            !IsInitialSetupComplete || Interlocked.Exchange(ref _monitorRunning, 1) != 0)
+            !_settings.TailscaleFunnelEnabled || !_gatewayReady || !IsInitialSetupComplete ||
+            Interlocked.Exchange(ref _monitorRunning, 1) != 0)
             return;
 
         if (!await _operationGate.WaitAsync(0).ConfigureAwait(false))
         {
             Interlocked.Exchange(ref _monitorRunning, 0);
+            if (!_shutdownStarted && !_disposed && _settings.TailscaleFunnelEnabled && _gatewayReady && IsInitialSetupComplete)
+                ScheduleMonitor(TimeSpan.FromSeconds(2));
             return;
         }
 
-        if (cancellationToken.IsCancellationRequested || _disposed || _shutdownStarted)
-        {
-            _operationGate.Release();
-            Interlocked.Exchange(ref _monitorRunning, 0);
-            return;
-        }
-
-        // A background health check is not a user operation. Keep the
-        // settings toggle stable while the monitor reconciles Funnel.
-        RaiseStatusChanged();
+        var nextDelay = RecoveryCheckInterval;
         try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (_service.IsHosting && await _service.CheckTailnetConnectivityAsync(cancellationToken).ConfigureAwait(false))
-            {
-                SetStatus(TailscaleConnectionPhase.Connected, I18n.Tr(
-                    "ПОДКЛЮЧЕНО · Публичный HTTPS-туннель активен.",
-                    "CONNECTED · Public HTTPS tunnel is active."));
+            if (cancellationToken.IsCancellationRequested || _disposed || _shutdownStarted ||
+                !_settings.TailscaleFunnelEnabled || !_gatewayReady)
                 return;
+
+            // 1. Lightweight local check first (0 external traffic while genuinely Online).
+            if (_service.IsPublished)
+            {
+                var health = await _service.CheckRealOnlineHealthAsync(cancellationToken).ConfigureAwait(false);
+                if (health.Healthy)
+                {
+                    SetStatus(TailscaleConnectionPhase.Connected, BuildConnectedStatusText());
+                    nextDelay = OnlineLocalHealthInterval;
+                    return;
+                }
+
+                // 2-strike confirmation: ignore brief 1s stream recycles (e.g. VPN proxy idle reconnect)
+                // unless the foreground Funnel process itself exited.
+                if (!string.Equals(health.Reason, "funnel_process_stopped", StringComparison.Ordinal))
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(2500), cancellationToken).ConfigureAwait(false);
+                    health = await _service.CheckRealOnlineHealthAsync(cancellationToken).ConfigureAwait(false);
+                    if (health.Healthy)
+                    {
+                        SetStatus(TailscaleConnectionPhase.Connected, BuildConnectedStatusText());
+                        nextDelay = OnlineLocalHealthInterval;
+                        return;
+                    }
+                }
+
+                // Confirmed real disconnect! Drop the "Connected" state in UI and start 10s recovery cycle.
+                _service.MarkOffline(health.Reason);
+                ErrorLog.LogConnection($"[Tailscale] Real disconnect confirmed ({health.Reason}). Starting 10s recovery cycle.");
+                SetStatus(TailscaleConnectionPhase.Reconnecting, I18n.Tr(
+                    "ПЕРЕПОДКЛЮЧЕНИЕ · Соединение потеряно, проверяю сеть и маршруты…",
+                    "RECONNECTING · Connection lost, probing network routes…"));
+                if (_service.IsHosting)
+                    await _service.StopHostingAsync().ConfigureAwait(false);
             }
 
-            if (_service.IsHosting)
-                await _service.StopHostingAsync().ConfigureAwait(false);
+            // 2. Full recovery attempt (route race Direct vs Proxy -> Smart-Relay -> Daemon online -> Funnel + DNS).
+            SetStatus(TailscaleConnectionPhase.Reconnecting, I18n.Tr(
+                "ПЕРЕПОДКЛЮЧЕНИЕ · Проверяю доступность Tailscale (Direct / Proxy)…",
+                "RECONNECTING · Probing Tailscale reachability (Direct / Proxy)…"));
 
-            SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
-                "ВОССТАНОВЛЕНИЕ · Проверяю службу, tray-клиент и авторизацию Tailscale…",
-                "RECOVERY · Checking the Tailscale service, tray client and authentication…"));
+            var routeTask = EnsureRouteAndRelayReadyAsync(
+                allowElevation: !_proxyElevationDeclinedInSession,
+                forceClassify: false,
+                cancellationToken);
+            var clientTask = _service.LaunchClientAsync(cancellationToken);
+            await Task.WhenAll(routeTask, clientTask).ConfigureAwait(false);
 
-            // Auto-recovery must use the same state machine as a manual Connect.
-            // In particular, a running Windows service with no per-user tray client
-            // can report NoState until tailscale-ipn.exe is launched.
-            await RunConnectionFlowAsync(cancellationToken).ConfigureAwait(false);
+            // Wait for tailscaled to become online over the winning route (bounded so 10s cadence stays responsive).
+            using var recoveryCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            recoveryCts.CancelAfter(TimeSpan.FromSeconds(40));
+            await RunConnectionFlowAsync(
+                allowElevation: !_proxyElevationDeclinedInSession,
+                recoveryCts.Token,
+                prelaunchedClientAlreadyRunning: clientTask.Result).ConfigureAwait(false);
 
-            SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
-                "ВОССТАНОВЛЕНИЕ · Запускаю публичный HTTPS-туннель…",
-                "RECOVERY · Starting the public HTTPS tunnel…"));
-            await _service.StartHostingAsync(cancellationToken).ConfigureAwait(false);
-            SetStatus(TailscaleConnectionPhase.Connected, I18n.Tr(
-                "ПОДКЛЮЧЕНО · Публичный HTTPS-туннель активен.",
-                "CONNECTED · Public HTTPS tunnel is active."));
+            SetStatus(TailscaleConnectionPhase.Reconnecting, I18n.Tr(
+                "ПЕРЕПОДКЛЮЧЕНИЕ · Поднимаю публичный HTTPS-туннель…",
+                "RECONNECTING · Starting public HTTPS tunnel…"));
+            var route = _activeRoute ?? TailscaleRoute.Direct;
+            await _service.StartHostingAsync(route, recoveryCts.Token).ConfigureAwait(false);
+
+            SetStatus(TailscaleConnectionPhase.Connected, BuildConnectedStatusText());
             ErrorLog.LogConnection(I18n.Tr(
-                "Tailscale Funnel восстановлен и активен: " + (_service.PublicUrl ?? string.Empty),
-                "Tailscale Funnel recovered and active: " + (_service.PublicUrl ?? string.Empty)));
+                $"Tailscale Funnel восстановлен ({route.DisplayName}): {_service.PublicUrl}",
+                $"Tailscale Funnel recovered ({route.DisplayName}): {_service.PublicUrl}"));
+            nextDelay = OnlineLocalHealthInterval;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Normal shutdown: no new UI state or retry is scheduled.
+            return;
+        }
+        catch (OperationCanceledException)
+        {
+            var timeoutMsg = I18n.Tr(
+                "Превышено время ожидания ответа от Tailscale. Повтор через 10 сек…",
+                "Timed out waiting for Tailscale to come online. Retrying in 10s…");
+            _service.MarkOffline(timeoutMsg);
+            if (!_shutdownStarted && !_disposed && _settings.TailscaleFunnelEnabled)
+            {
+                SetStatus(TailscaleConnectionPhase.Offline,
+                    I18n.Tr("ОФЛАЙН · ", "OFFLINE · ") + timeoutMsg);
+            }
+            nextDelay = RecoveryCheckInterval;
         }
         catch (Exception exception)
         {
-            if (IsElevationCanceled(exception))
-                StopMonitor();
-
-            if (!_shutdownStarted && !_disposed)
+            _service.MarkOffline(exception.Message);
+            if (!_shutdownStarted && !_disposed && _settings.TailscaleFunnelEnabled)
+            {
                 SetStatus(TailscaleConnectionPhase.Offline,
                     I18n.Tr("ОФЛАЙН · ", "OFFLINE · ") + exception.Message);
+            }
+            nextDelay = RecoveryCheckInterval;
         }
         finally
         {
             _operationGate.Release();
             Interlocked.Exchange(ref _monitorRunning, 0);
-            if (!_shutdownStarted && !_disposed)
-                RaiseStatusChanged();
+            if (!_shutdownStarted && !_disposed && _settings.TailscaleFunnelEnabled && _gatewayReady && IsInitialSetupComplete)
+                ScheduleMonitor(nextDelay);
+            RaiseStatusChanged();
         }
+    }
+
+    private string BuildConnectedStatusText()
+    {
+        var route = _activeRoute ?? TailscaleRoute.Direct;
+        var routeSuffix = route.Kind switch
+        {
+            TailscaleRouteKind.Direct => I18n.Tr("напрямую", "direct"),
+            TailscaleRouteKind.DirectTlsSplit => I18n.Tr("напрямую · обход DPI (TLS)", "direct · DPI-safe (TLS)"),
+            TailscaleRouteKind.DirectTcpSplit => I18n.Tr("напрямую · обход DPI (TCP)", "direct · DPI-safe (TCP)"),
+            _ => route.DisplayName
+        };
+        return I18n.Tr(
+            $"ПОДКЛЮЧЕНО · Публичный HTTPS-туннель активен ({routeSuffix}).",
+            $"CONNECTED · Public HTTPS tunnel is active ({routeSuffix}).");
+    }
+
+    private void OnNetworkAddressChanged(object? sender, EventArgs e)
+    {
+        if (_disposed || _shutdownStarted || !_settings.TailscaleFunnelEnabled || !_gatewayReady)
+            return;
+        ScheduleMonitor(Phase == TailscaleConnectionPhase.Connected
+            ? TimeSpan.FromSeconds(3)
+            : TimeSpan.FromMilliseconds(1200));
+    }
+
+    private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode != PowerModes.Resume) return;
+        if (_disposed || _shutdownStarted || !_settings.TailscaleFunnelEnabled || !_gatewayReady)
+            return;
+        ScheduleMonitor(TimeSpan.FromSeconds(2));
+    }
+
+    private void Relay_RouteFailureDetected(object? sender, string reason)
+    {
+        if (_disposed || _shutdownStarted) return;
+        // Only accelerate recovery when dropping out of Connected;
+        // while already offline/reconnecting, let the strict 10-second timer govern retries.
+        if (Phase != TailscaleConnectionPhase.Connected) return;
+        if (_settings.TailscaleFunnelEnabled && _gatewayReady && IsInitialSetupComplete)
+            ScheduleMonitor(TimeSpan.FromMilliseconds(800));
     }
 
     private async Task StopForGatewayUnavailableAsync()
     {
-        if (_disposed || _shutdownStarted || !_settings.TailscaleFunnelEnabled)
-            return;
+        if (_disposed || _shutdownStarted || !_settings.TailscaleFunnelEnabled) return;
+        if (!await _operationGate.WaitAsync(0).ConfigureAwait(false)) return;
 
-        if (!await _operationGate.WaitAsync(0).ConfigureAwait(false))
-            return;
-
-        // Gateway availability is also maintained in the background.
-        // Do not reuse the manual-operation busy flag that drives the UI button.
         RaiseStatusChanged();
         try
         {
@@ -706,8 +926,7 @@ public sealed class TailscaleConnectionManager : IDisposable
         }
         catch (Exception exception)
         {
-            SetStatus(TailscaleConnectionPhase.Error, I18n.Tr(
-                "ОШИБКА ОСТАНОВКИ ТУННЕЛЯ · ", "TUNNEL STOP ERROR · ") + exception.Message);
+            SetStatus(TailscaleConnectionPhase.Error, I18n.Tr("ОШИБКА ОСТАНОВКИ ТУННЕЛЯ · ", "TUNNEL STOP ERROR · ") + exception.Message);
             ErrorLog.Write("TailscaleConnectionManager.GatewayUnavailable", exception);
         }
         finally
@@ -726,123 +945,63 @@ public sealed class TailscaleConnectionManager : IDisposable
             if (current.HResult == unchecked((int)0x800704C7))
                 return true;
         }
-
         return false;
     }
 
     private void Service_FunnelAuthorizationRequired(string authorizationUrl)
     {
-        if (_disposed || _shutdownStarted)
-            return;
-
+        if (_disposed || _shutdownStarted) return;
         if (OpenFunnelApprovalPage(authorizationUrl))
         {
             SetStatus(TailscaleConnectionPhase.WaitingForFunnelApproval, I18n.Tr(
-                "РАЗРЕШЕНИЕ FUNNEL · Открыл отдельную страницу подтверждения Funnel. Нажмите Enable; Hotplug продолжит автоматически.",
-                "FUNNEL APPROVAL · Opened the separate Funnel approval page. Select Enable; Hotplug will continue automatically."));
+                "РАЗРЕШЕНИЕ FUNNEL · Открыл отдельную страницу подтверждения Funnel. Нажмите Enable.",
+                "FUNNEL APPROVAL · Opened the Funnel approval page. Select Enable."));
         }
     }
 
     private bool OpenHttpsSetupPage(string value)
     {
-        if (!TryValidateHttpsSetupUrl(value, out var setupUrl))
-            return false;
-
-        lock (_sync)
-        {
-            if (string.Equals(_lastOpenedHttpsSetupUrl, setupUrl, StringComparison.Ordinal))
-                return true;
-            _lastOpenedHttpsSetupUrl = setupUrl;
-        }
-
-        try
-        {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = setupUrl,
-                UseShellExecute = true
-            });
-            return true;
-        }
-        catch (Exception exception)
-        {
-            lock (_sync) _lastOpenedHttpsSetupUrl = string.Empty;
-            ErrorLog.Write("TailscaleConnectionManager.OpenHttpsSetupPage", exception);
-            return false;
-        }
-    }
-
-    private static bool TryValidateHttpsSetupUrl(string value, out string normalizedUrl)
-    {
-        normalizedUrl = string.Empty;
         if (!Uri.TryCreate(value?.Trim(), UriKind.Absolute, out var uri) ||
             !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(uri.Host, "tailscale.com", StringComparison.OrdinalIgnoreCase) ||
-            !string.Equals(uri.AbsolutePath, "/s/https", StringComparison.OrdinalIgnoreCase) ||
-            !string.IsNullOrEmpty(uri.UserInfo))
+            !string.Equals(uri.AbsolutePath, "/s/https", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        normalizedUrl = uri.AbsoluteUri;
-        return true;
+        var setupUrl = uri.AbsoluteUri;
+        lock (_sync)
+        {
+            if (string.Equals(_lastOpenedHttpsSetupUrl, setupUrl, StringComparison.Ordinal)) return true;
+            _lastOpenedHttpsSetupUrl = setupUrl;
+        }
+        try { Process.Start(new ProcessStartInfo { FileName = setupUrl, UseShellExecute = true }); return true; }
+        catch (Exception ex) { lock (_sync) _lastOpenedHttpsSetupUrl = string.Empty; ErrorLog.Write("TailscaleConnectionManager.OpenHttpsSetupPage", ex); return false; }
     }
 
     private bool OpenFunnelApprovalPage(string value)
     {
-        if (!TryValidateFunnelApprovalUrl(value, out var authorizationUrl))
-            return false;
-
-        lock (_sync)
-        {
-            if (string.Equals(_lastOpenedFunnelApprovalUrl, authorizationUrl, StringComparison.Ordinal))
-                return true;
-            _lastOpenedFunnelApprovalUrl = authorizationUrl;
-        }
-
-        try
-        {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = authorizationUrl,
-                UseShellExecute = true
-            });
-            return true;
-        }
-        catch (Exception exception)
-        {
-            lock (_sync) _lastOpenedFunnelApprovalUrl = string.Empty;
-            ErrorLog.Write("TailscaleConnectionManager.OpenFunnelApprovalPage", exception);
-            return false;
-        }
-    }
-
-    private static bool TryValidateFunnelApprovalUrl(string value, out string normalizedUrl)
-    {
-        normalizedUrl = string.Empty;
         if (!Uri.TryCreate(value?.Trim(), UriKind.Absolute, out var uri) ||
             !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(uri.Host, "login.tailscale.com", StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(uri.AbsolutePath, "/f/funnel", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        var node = uri.Query.TrimStart('?').Split('&')
-            .FirstOrDefault(part => part.StartsWith("node=", StringComparison.OrdinalIgnoreCase));
-        if (string.IsNullOrWhiteSpace(node) || node.Length <= 5)
-            return false;
-
-        normalizedUrl = uri.AbsoluteUri;
-        return true;
+        var authorizationUrl = uri.AbsoluteUri;
+        lock (_sync)
+        {
+            if (string.Equals(_lastOpenedFunnelApprovalUrl, authorizationUrl, StringComparison.Ordinal)) return true;
+            _lastOpenedFunnelApprovalUrl = authorizationUrl;
+        }
+        try { Process.Start(new ProcessStartInfo { FileName = authorizationUrl, UseShellExecute = true }); return true; }
+        catch (Exception ex) { lock (_sync) _lastOpenedFunnelApprovalUrl = string.Empty; ErrorLog.Write("TailscaleConnectionManager.OpenFunnelApprovalPage", ex); return false; }
     }
 
     private void Service_StatusChanged(object? sender, TailscaleStatusEventArgs e)
     {
-        if (_disposed)
-            return;
+        if (_disposed) return;
 
         if (_service.IsPublished)
         {
-            SetStatus(TailscaleConnectionPhase.Connected, I18n.Tr(
-                "ПОДКЛЮЧЕНО · Публичный HTTPS-туннель активен.",
-                "CONNECTED · Public HTTPS tunnel is active."));
+            SetStatus(TailscaleConnectionPhase.Connected, BuildConnectedStatusText());
         }
         else if (_busy && _phase == TailscaleConnectionPhase.Connecting)
         {
@@ -850,7 +1009,10 @@ public sealed class TailscaleConnectionManager : IDisposable
         }
         else if (_settings.TailscaleFunnelEnabled && _phase == TailscaleConnectionPhase.Connected)
         {
-            SetStatus(TailscaleConnectionPhase.Offline, e.Status);
+            SetStatus(TailscaleConnectionPhase.Reconnecting, I18n.Tr(
+                "ПЕРЕПОДКЛЮЧЕНИЕ · Туннель прервался, выполняется восстановление…",
+                "RECONNECTING · Tunnel dropped, recovering…"));
+            ScheduleMonitor(TimeSpan.FromSeconds(1));
         }
         else
         {
@@ -890,24 +1052,35 @@ public sealed class TailscaleConnectionManager : IDisposable
         StatusChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    private void UnsubscribeSystemEvents()
+    {
+        try { NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged; } catch { }
+        try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
+    }
+
+    private void CleanupOwnedResources()
+    {
+        _service.StatusChanged -= Service_StatusChanged;
+        _service.FunnelAuthorizationRequired -= Service_FunnelAuthorizationRequired;
+        _relay.RouteFailureDetected -= Relay_RouteFailureDetected;
+        _service.Dispose();
+        _relay.Dispose();
+        _disposed = true;
+    }
+
     private void ThrowIfDisposed()
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(TailscaleConnectionManager));
+        if (_disposed) throw new ObjectDisposedException(nameof(TailscaleConnectionManager));
     }
 
     public void Dispose()
     {
-        if (_disposed)
-            return;
-
+        if (_disposed) return;
         _shutdownStarted = true;
         _lifetimeCancellation.Cancel();
         StopMonitor();
+        UnsubscribeSystemEvents();
         lock (_sync) _activeConnection?.Cancel();
-        _service.StatusChanged -= Service_StatusChanged;
-        _service.FunnelAuthorizationRequired -= Service_FunnelAuthorizationRequired;
-        _service.Dispose();
-        _disposed = true;
+        CleanupOwnedResources();
     }
 }

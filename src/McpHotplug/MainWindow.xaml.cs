@@ -132,8 +132,8 @@ public partial class MainWindow : Window
             // Update discovery is independent from the MCP startup/handshake path.
             if (AppPaths.CanInstallUpdates && _settings.CheckUpdatesOnStartup == true && !App.SkipUpdateCheck)
                 _ = CheckForUpdatesAsync(showUpToDateStatus: false);
-            await SyncMcpInfrastructureAsync(forceRetryQuarantined: true);
             _tailscaleManager.Start(_mcpInfrastructure.IsReady);
+            await SyncMcpInfrastructureAsync(forceRetryQuarantined: true);
             var dependencyReport = McpDependencyResolver.GetCachedReport();
             if (dependencyReport != null && !dependencyReport.CoreReady)
             {
@@ -1809,6 +1809,7 @@ public partial class MainWindow : Window
         phase switch
         {
             TailscaleConnectionPhase.Connecting or
+            TailscaleConnectionPhase.Reconnecting or
             TailscaleConnectionPhase.Disconnecting or
             TailscaleConnectionPhase.WaitingForLogin or
             TailscaleConnectionPhase.WaitingForDeviceApproval or
@@ -1849,7 +1850,7 @@ public partial class MainWindow : Window
         TailscaleStatusText.Text = status;
         TailscaleAuthStatusText.Text = status;
 
-        var connected = isConnected || phase == TailscaleConnectionPhase.Connected;
+        var connected = isConnected;
         var connecting = IsTailscaleConnecting(phase);
         var accent = (Brush)FindResource(connected
             ? "StatusConnectedBrush"
@@ -1935,8 +1936,7 @@ public partial class MainWindow : Window
         DashboardGatewayPort.Foreground = gatewayAccent;
 
         var phase = _tailscaleManager.Phase;
-        var onlineConnected = _tailscaleManager.IsConnected ||
-                              phase == TailscaleConnectionPhase.Connected;
+        var onlineConnected = _tailscaleManager.IsConnected;
         var onlineConnecting = IsTailscaleConnecting(phase);
         var onlineAccent = onlineConnected
             ? connectedBrush
@@ -1951,9 +1951,11 @@ public partial class MainWindow : Window
 
         DashboardPublicUrlState.Text = onlineConnected
             ? I18n.Tr("Активно", "Active")
-            : onlineConnecting
-                ? I18n.Tr("Подключение…", "Connecting…")
-                : I18n.Tr("Не активно", "Inactive");
+            : phase == TailscaleConnectionPhase.Reconnecting
+                ? I18n.Tr("Переподключение…", "Reconnecting…")
+                : onlineConnecting
+                    ? I18n.Tr("Подключение…", "Connecting…")
+                    : I18n.Tr("Не активно", "Inactive");
         DashboardPublicUrlState.Foreground = onlineAccent;
         Kpi3SubText.Foreground = onlineAccent;
         Kpi3CardBorder.BorderBrush = onlineBorderAccent;
