@@ -142,19 +142,55 @@ internal sealed class TailscaleService : IDisposable
     }
 
     /// <summary>
-    /// One-time UAC helper that writes HTTPS_PROXY=http://127.0.0.1:18006 to the Windows
-    /// Tailscale service Environment (backing up previous values) and restarts tailscaled.
+    /// Read-only registry check: verifies whether the Windows Tailscale service has
+    /// GODEBUG=tlsmlkem=0 enabled so Go TLS 1.3 ClientHello stays within a single TCP segment.
+    /// </summary>
+    public static bool IsServiceMlkemDisabled()
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tailscale");
+            if (key == null) return false;
+            if (key.GetValue("Environment") is not string[] lines) return false;
+
+            foreach (var rawLine in lines)
+            {
+                var line = rawLine?.Trim();
+                if (string.IsNullOrEmpty(line) || !line!.StartsWith("GODEBUG=", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                var value = line.Substring("GODEBUG=".Length);
+                if (value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Any(tok => string.Equals(tok.Trim(), "tlsmlkem=0", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static bool IsServiceFullyConfiguredForRelay() =>
+        IsServiceProxyConfiguredForRelay() && IsServiceMlkemDisabled();
+
+    /// <summary>
+    /// One-time UAC helper that writes HTTPS_PROXY=http://127.0.0.1:18006 and GODEBUG=tlsmlkem=0
+    /// to the Windows Tailscale service Environment (backing up previous values) and restarts tailscaled.
     /// </summary>
     public async Task EnsureServiceProxyConfiguredAsync(CancellationToken cancellationToken = default)
     {
-        if (IsServiceProxyConfiguredForRelay())
+        if (IsServiceFullyConfiguredForRelay())
             return;
 
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfDisposed();
-            if (IsServiceProxyConfiguredForRelay())
+            if (IsServiceFullyConfiguredForRelay())
                 return;
 
             Publish(
@@ -179,8 +215,8 @@ internal sealed class TailscaleService : IDisposable
             }
 
             ErrorLog.LogConnection(I18n.Tr(
-                $"Служба Tailscale настроена на локальный Smart-Relay ({TailscaleSmartRelay.RelayProxyUrl}).",
-                $"Tailscale service configured to use local Smart-Relay ({TailscaleSmartRelay.RelayProxyUrl})."));
+                $"Служба Tailscale настроена на локальный Smart-Relay ({TailscaleSmartRelay.RelayProxyUrl}, tlsmlkem=0).",
+                $"Tailscale service configured to use local Smart-Relay ({TailscaleSmartRelay.RelayProxyUrl}, tlsmlkem=0)."));
         }
         finally
         {
@@ -331,15 +367,21 @@ internal sealed class TailscaleService : IDisposable
             if (string.IsNullOrWhiteSpace(executable)) return false;
 
             var down = await RunCommandAsync(executable!, "down", 4000, cancellationToken).ConfigureAwait(false);
+            if (ErrorLog.Enabled)
+                ErrorLog.LogConnection($"[Tailscale][CLI] tailscale down exit={down.ExitCode}" + (string.IsNullOrWhiteSpace(down.CombinedOutput) ? string.Empty : $" out={down.CombinedOutput}"));
             if (down.ExitCode != 0)
                 return false;
 
             try
             {
-                await RunCommandAsync(executable!, "up --accept-dns=false --unattended=true", 1500, CancellationToken.None).ConfigureAwait(false);
+                var up = await RunCommandAsync(executable!, "up --accept-dns=false --unattended=true", 1500, CancellationToken.None).ConfigureAwait(false);
+                if (ErrorLog.Enabled)
+                    ErrorLog.LogConnection($"[Tailscale][CLI] tailscale up exit={up.ExitCode}" + (string.IsNullOrWhiteSpace(up.CombinedOutput) ? string.Empty : $" out={up.CombinedOutput}"));
             }
             catch (System.TimeoutException)
             {
+                if (ErrorLog.Enabled)
+                    ErrorLog.LogConnection("[Tailscale][CLI] tailscale up returned after 1500ms wait (daemon bringing up asynchronously).");
                 // tailscaled receives WantRunning=true immediately; CLI waiting for online is expected.
             }
             return true;
@@ -500,9 +542,12 @@ internal sealed class TailscaleService : IDisposable
             // Critical fix: never trust a cached 100.x IP if Self.Online == false or Health reports coordination failure!
             if (!live.SelfOnline || live.HasFatalHealthError)
             {
+                var healthSummary = live.Health.Count > 0 ? string.Join("; ", live.Health) : string.Empty;
                 var healthMsg = !string.IsNullOrWhiteSpace(live.FatalHealthSummary)
                     ? live.FatalHealthSummary
-                    : I18n.Tr("Демон Tailscale не в сети (нет связи с controlplane.tailscale.com).", "Tailscale daemon is offline (cannot reach controlplane.tailscale.com).");
+                    : (!string.IsNullOrWhiteSpace(healthSummary)
+                        ? $"Self.Online={live.SelfOnline} | Health: {healthSummary}"
+                        : I18n.Tr("Демон Tailscale не в сети (нет связи с controlplane.tailscale.com).", "Tailscale daemon is offline (cannot reach controlplane.tailscale.com)."));
                 return (false, "TAILNET_OFFLINE|" + healthMsg);
             }
 
@@ -783,6 +828,8 @@ internal sealed class TailscaleService : IDisposable
                     dnsState = await TailscaleNetworkProbe
                         .CheckPublicDnsAsync(publicUri.Host, activeRoute ?? TailscaleRoute.Direct, cancellationToken)
                         .ConfigureAwait(false);
+                    if (ErrorLog.Enabled)
+                        ErrorLog.LogConnection($"[Tailscale][DNS] {publicUri.Host} via {(activeRoute ?? TailscaleRoute.Direct).DisplayName} -> {dnsState}");
                     if (dnsState == PublicDnsState.Resolved)
                         break;
                     await Task.Delay(2000, cancellationToken).ConfigureAwait(false);

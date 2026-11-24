@@ -58,6 +58,9 @@ public sealed class TailscaleConnectionManager : IDisposable
     private int _monitorRunning;
     private string _lastOpenedFunnelApprovalUrl = string.Empty;
     private string _lastOpenedHttpsSetupUrl = string.Empty;
+    private long _controlplaneFailureSeq;
+    private string _controlplaneFailureRouteKey = string.Empty;
+    private string _controlplaneFailureReason = string.Empty;
 
     public TailscaleConnectionManager(AppSettings settings, Func<bool> saveSettings)
     {
@@ -66,6 +69,7 @@ public sealed class TailscaleConnectionManager : IDisposable
         _service.StatusChanged += Service_StatusChanged;
         _service.FunnelAuthorizationRequired += Service_FunnelAuthorizationRequired;
         _relay.RouteFailureDetected += Relay_RouteFailureDetected;
+        _relay.ControlplaneTunnelFailed += Relay_ControlplaneTunnelFailed;
 
         NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
@@ -250,6 +254,14 @@ public sealed class TailscaleConnectionManager : IDisposable
 
             var liveNow = liveTask.Result;
             var relayConfigured = TailscaleService.IsServiceProxyConfiguredForRelay();
+            if (ErrorLog.Enabled)
+            {
+                var healthText = liveNow.Health.Count > 0 ? string.Join("; ", liveNow.Health) : "none";
+                ErrorLog.LogConnection(
+                    $"[Tailscale][Connect] Live status: reachable={liveNow.DaemonReachable}, state={liveNow.BackendState}, " +
+                    $"online={liveNow.SelfOnline}, ip={liveNow.Ipv4}, fatalHealth={liveNow.HasFatalHealthError}, " +
+                    $"relayConfigured={relayConfigured}, relayRunning={_relay.IsRunning}, health=[{healthText}]");
+            }
             if (liveNow.IsTailnetOnline && (!relayConfigured || _relay.IsRunning))
             {
                 // Daemon is already online on the active route: do NOT re-race or tear down its live tunnels!
@@ -373,7 +385,8 @@ public sealed class TailscaleConnectionManager : IDisposable
             DateTime.UtcNow - _lastRouteVerifiedUtc < TimeSpan.FromSeconds(15))
         {
             var relayReady = TailscaleService.IsServiceProxyConfiguredForRelay();
-            if (relayReady || cachedRoute.Kind == TailscaleRouteKind.Direct)
+            var mlkemReady = !cachedRoute.IsDpiSafeDirect || TailscaleService.IsServiceMlkemDisabled();
+            if ((relayReady || cachedRoute.Kind == TailscaleRouteKind.Direct) && mlkemReady)
             {
                 return new TailscaleRouteProbeResult
                 {
@@ -404,13 +417,21 @@ public sealed class TailscaleConnectionManager : IDisposable
         _lastRouteVerifiedUtc = DateTime.UtcNow;
 
         var serviceUsesRelay = TailscaleService.IsServiceProxyConfiguredForRelay();
+        var serviceMlkemDisabled = TailscaleService.IsServiceMlkemDisabled();
+        if (ErrorLog.Enabled)
+            ErrorLog.LogConnection($"[Tailscale][Route] Selected={winner} (prev={previousRoute?.DisplayName ?? "none"}, latency={probe.LatencyMs}ms, serviceUsesRelay={serviceUsesRelay}, mlkemDisabled={serviceMlkemDisabled})");
+
         if (serviceUsesRelay || winner.Kind != TailscaleRouteKind.Direct)
         {
             _relay.EnsureStarted();
             _relay.SetRoute(winner, abortExistingTunnels: !winner.Equals(previousRoute));
         }
 
-        if (winner.Kind != TailscaleRouteKind.Direct && !serviceUsesRelay)
+        var needsServiceSetup =
+            (winner.Kind != TailscaleRouteKind.Direct && !serviceUsesRelay) ||
+            (winner.IsDpiSafeDirect && !serviceMlkemDisabled);
+
+        if (needsServiceSetup)
         {
             if (!allowElevation || _proxyElevationDeclinedInSession)
             {
@@ -427,8 +448,8 @@ public sealed class TailscaleConnectionManager : IDisposable
             {
                 _proxyElevationDeclinedInSession = true;
                 throw new InvalidOperationException(I18n.Tr(
-                    "Запрос прав администратора отменён. Без однократной настройки прокси служба Tailscale не сможет использовать VPN в режиме прокси.",
-                    "Administrator prompt was canceled. Without one-time proxy setup, the Tailscale service cannot use system-proxy VPN."));
+                    "Запрос прав администратора отменён. Без однократной настройки прокси служба Tailscale не сможет использовать выбранный маршрут.",
+                    "Administrator prompt was canceled. Without one-time proxy setup, the Tailscale service cannot use the selected route."));
             }
         }
 
@@ -464,10 +485,14 @@ public sealed class TailscaleConnectionManager : IDisposable
         var loginRequestAttempted = false;
         var pendingSince = DateTime.MinValue;
         var offlineSince = DateTime.MinValue;
-        var currentRouteOfflineSince = DateTime.MinValue;
+        var routeActivatedUtc = DateTime.UtcNow;
+        var failureSeqAtRouteStart = SnapshotControlplaneFailure().Seq;
+        var baselineHealthMsg = string.Empty;
         var wakeAttemptedForCurrentRoute = false;
         var failedTailnetRouteKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var deviceApprovalPageOpened = false;
+        var lastLoggedDetail = string.Empty;
+        var lastLoggedRouteKey = string.Empty;
 
         while (DateTime.UtcNow < deadline)
         {
@@ -484,66 +509,131 @@ public sealed class TailscaleConnectionManager : IDisposable
             {
                 var now = DateTime.UtcNow;
                 var firstOfflinePoll = offlineSince == DateTime.MinValue;
+                var msg = details.Substring("TAILNET_OFFLINE|".Length).Trim();
                 if (firstOfflinePoll)
                 {
                     offlineSince = now;
-                    currentRouteOfflineSince = now;
+                    routeActivatedUtc = now;
+                    baselineHealthMsg = msg;
+                    failureSeqAtRouteStart = SnapshotControlplaneFailure().Seq;
                 }
-                var msg = details.Substring("TAILNET_OFFLINE|".Length).Trim();
 
                 var routeLabel = (_activeRoute ?? TailscaleRoute.Direct).DisplayName;
+                var currentRouteKey = (_activeRoute ?? TailscaleRoute.Direct).Key;
                 SetStatus(TailscaleConnectionPhase.Connecting, I18n.Tr(
                     $"ПОДКЛЮЧЕНИЕ · Вывожу Tailscale в сеть ({routeLabel})…",
                     $"CONNECTING · Bringing Tailscale online ({routeLabel})…"));
 
-                // Give tailscaled enough time to complete down->up + PollNetMap on a clean route (12s)
-                // before demoting the route and failing over to another candidate.
-                var failoverWindow = _activeRoute != null &&
-                    (_activeRoute.Kind == TailscaleRouteKind.HttpProxy ||
-                     _activeRoute.Kind == TailscaleRouteKind.Socks5Proxy ||
-                     _activeRoute.Kind == TailscaleRouteKind.Direct)
-                    ? TimeSpan.FromSeconds(12)
-                    : TimeSpan.FromSeconds(6);
-
-                var shouldFailoverRoute = !firstOfflinePoll &&
-                    _activeRoute != null &&
-                    (now - currentRouteOfflineSince >= failoverWindow);
-
-                if (shouldFailoverRoute)
+                if (ErrorLog.Enabled && (firstOfflinePoll || !string.Equals(msg, lastLoggedDetail, StringComparison.Ordinal) || !string.Equals(currentRouteKey, lastLoggedRouteKey, StringComparison.Ordinal)))
                 {
-                    failedTailnetRouteKeys.Add(_activeRoute!.Key);
+                    lastLoggedDetail = msg;
+                    lastLoggedRouteKey = currentRouteKey;
+                    ErrorLog.LogConnection(
+                        $"[Tailscale][Flow] TAILNET_OFFLINE on route={routeLabel} " +
+                        $"(routeElapsed={(now - routeActivatedUtc).TotalSeconds:F1}s, " +
+                        $"totalElapsed={(now - offlineSince).TotalSeconds:F1}s): {msg}");
+                }
+
+                if (firstOfflinePoll)
+                {
+                    var prevRoute = _activeRoute;
                     var probe = await EnsureRouteAndRelayReadyAsync(
                         allowElevation,
                         forceClassify: false,
                         cancellationToken,
                         failedTailnetRouteKeys).ConfigureAwait(false);
-                    currentRouteOfflineSince = DateTime.UtcNow;
-                    wakeAttemptedForCurrentRoute = false;
-                    if (probe.Success && _relay.IsRunning)
-                        _relay.AbortActiveTunnels();
+                    var routeChanged = probe.WinningRoute != null && !probe.WinningRoute.Equals(prevRoute);
+                    if (routeChanged)
+                    {
+                        routeActivatedUtc = DateTime.UtcNow;
+                        failureSeqAtRouteStart = SnapshotControlplaneFailure().Seq;
+                        baselineHealthMsg = msg;
+                    }
+
+                    // Only nudge tailscaled out of its backoff timer if the route changed or daemon already holds a prior error.
+                    if ((routeChanged || LooksLikeDaemonBackoffError(msg)) && !wakeAttemptedForCurrentRoute)
+                    {
+                        wakeAttemptedForCurrentRoute = true;
+                        var wakeSw = Stopwatch.StartNew();
+                        if (ErrorLog.Enabled)
+                            ErrorLog.LogConnection($"[Tailscale][Flow] Waking daemon (down->up) for route={(_activeRoute ?? TailscaleRoute.Direct).DisplayName}…");
+                        var woken = await _service.WakeDaemonReconnectAsync(cancellationToken).ConfigureAwait(false);
+                        if (ErrorLog.Enabled)
+                            ErrorLog.LogConnection($"[Tailscale][Flow] WakeDaemonReconnect finished (ok={woken}) in {wakeSw.ElapsedMilliseconds}ms.");
+                        await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+                        continue;
+                    }
                 }
-                else if (firstOfflinePoll)
+                else if (_activeRoute != null)
                 {
-                    var probe = await EnsureRouteAndRelayReadyAsync(
-                        allowElevation,
-                        forceClassify: false,
-                        cancellationToken,
-                        failedTailnetRouteKeys).ConfigureAwait(false);
-                    if (probe.Success && _relay.IsRunning)
-                        _relay.AbortActiveTunnels();
+                    // Data-driven failover: only demote the active route on an observed failure signal
+                    // (Relay controlplane tunnel failure, new daemon transport error, or full TCP retransmit watchdog).
+                    string? failoverReason = null;
+                    var cpFail = SnapshotControlplaneFailure();
+                    if (cpFail.Seq > failureSeqAtRouteStart &&
+                        string.Equals(cpFail.RouteKey, _activeRoute.Key, StringComparison.OrdinalIgnoreCase))
+                    {
+                        failoverReason = "relay_controlplane_failed: " + cpFail.Reason;
+                    }
+                    else if (!string.Equals(msg, baselineHealthMsg, StringComparison.Ordinal) &&
+                             LooksLikeDaemonTransportError(msg))
+                    {
+                        failoverReason = "daemon_transport_error: " + msg;
+                    }
+                    else if (now - routeActivatedUtc >= TimeSpan.FromSeconds(22))
+                    {
+                        failoverReason = "no_online_progress_22s";
+                    }
+
+                    if (failoverReason != null)
+                    {
+                        failedTailnetRouteKeys.Add(_activeRoute.Key);
+                        if (ErrorLog.Enabled)
+                        {
+                            ErrorLog.LogConnection(
+                                $"[Tailscale][Flow] Failover: demoting route={_activeRoute} after {(now - routeActivatedUtc).TotalSeconds:F1}s " +
+                                $"(reason={failoverReason}). Excluded=[{string.Join(", ", failedTailnetRouteKeys)}]");
+                        }
+                        await EnsureRouteAndRelayReadyAsync(
+                            allowElevation,
+                            forceClassify: false,
+                            cancellationToken,
+                            failedTailnetRouteKeys).ConfigureAwait(false);
+                        routeActivatedUtc = DateTime.UtcNow;
+                        failureSeqAtRouteStart = SnapshotControlplaneFailure().Seq;
+                        baselineHealthMsg = msg;
+                        wakeAttemptedForCurrentRoute = true;
+
+                        var wakeSw = Stopwatch.StartNew();
+                        if (ErrorLog.Enabled)
+                            ErrorLog.LogConnection($"[Tailscale][Flow] Waking daemon (down->up) after failover to route={(_activeRoute ?? TailscaleRoute.Direct).DisplayName}…");
+                        var woken = await _service.WakeDaemonReconnectAsync(cancellationToken).ConfigureAwait(false);
+                        if (ErrorLog.Enabled)
+                            ErrorLog.LogConnection($"[Tailscale][Flow] WakeDaemonReconnect finished (ok={woken}) in {wakeSw.ElapsedMilliseconds}ms.");
+                        await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+                        continue;
+                    }
+
+                    if (!wakeAttemptedForCurrentRoute && LooksLikeDaemonBackoffError(msg))
+                    {
+                        wakeAttemptedForCurrentRoute = true;
+                        var wakeSw = Stopwatch.StartNew();
+                        if (ErrorLog.Enabled)
+                            ErrorLog.LogConnection($"[Tailscale][Flow] Waking daemon (down->up) from backoff for route={_activeRoute.DisplayName}…");
+                        var woken = await _service.WakeDaemonReconnectAsync(cancellationToken).ConfigureAwait(false);
+                        if (ErrorLog.Enabled)
+                            ErrorLog.LogConnection($"[Tailscale][Flow] WakeDaemonReconnect finished (ok={woken}) in {wakeSw.ElapsedMilliseconds}ms.");
+                        await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+                        continue;
+                    }
                 }
 
-                // Give tailscaled 1.2s to reconnect naturally after AbortActiveTunnels before forcing down->up.
-                if (!wakeAttemptedForCurrentRoute && (now - currentRouteOfflineSince >= TimeSpan.FromMilliseconds(1200)))
+                if (DateTime.UtcNow - offlineSince >= TimeSpan.FromSeconds(45))
                 {
-                    wakeAttemptedForCurrentRoute = true;
-                    await _service.WakeDaemonReconnectAsync(cancellationToken).ConfigureAwait(false);
-                    await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
-                    continue;
-                }
-
-                if (DateTime.UtcNow - offlineSince >= TimeSpan.FromSeconds(35))
+                    if (ErrorLog.Enabled)
+                        ErrorLog.LogConnection($"[Tailscale][Flow] TAILNET_OFFLINE timed out after 45s: {msg}");
                     throw new TimeoutException(msg);
+                }
 
                 await Task.Delay(TimeSpan.FromMilliseconds(900), cancellationToken);
                 continue;
@@ -776,12 +866,21 @@ public sealed class TailscaleConnectionManager : IDisposable
 
                 // 2-strike confirmation: ignore brief 1s stream recycles (e.g. VPN proxy idle reconnect)
                 // unless the foreground Funnel process itself exited.
+                if (ErrorLog.Enabled)
+                {
+                    var h1 = health.LiveStatus.Health.Count > 0 ? string.Join("; ", health.LiveStatus.Health) : "none";
+                    ErrorLog.LogConnection(
+                        $"[Tailscale][Health] Strike 1 failed: reason={health.Reason}, state={health.LiveStatus.BackendState}, " +
+                        $"online={health.LiveStatus.SelfOnline}, health=[{h1}]");
+                }
                 if (!string.Equals(health.Reason, "funnel_process_stopped", StringComparison.Ordinal))
                 {
                     await Task.Delay(TimeSpan.FromMilliseconds(2500), cancellationToken).ConfigureAwait(false);
                     health = await _service.CheckRealOnlineHealthAsync(cancellationToken).ConfigureAwait(false);
                     if (health.Healthy)
                     {
+                        if (ErrorLog.Enabled)
+                            ErrorLog.LogConnection("[Tailscale][Health] Strike 2 recovered.");
                         SetStatus(TailscaleConnectionPhase.Connected, BuildConnectedStatusText());
                         nextDelay = OnlineLocalHealthInterval;
                         return;
@@ -790,7 +889,10 @@ public sealed class TailscaleConnectionManager : IDisposable
 
                 // Confirmed real disconnect! Drop the "Connected" state in UI and start 10s recovery cycle.
                 _service.MarkOffline(health.Reason);
-                ErrorLog.LogConnection($"[Tailscale] Real disconnect confirmed ({health.Reason}). Starting 10s recovery cycle.");
+                var confirmedHealth = health.LiveStatus.Health.Count > 0
+                    ? " | health=[" + string.Join("; ", health.LiveStatus.Health) + "]"
+                    : string.Empty;
+                ErrorLog.LogConnection($"[Tailscale] Real disconnect confirmed ({health.Reason}, state={health.LiveStatus.BackendState}, online={health.LiveStatus.SelfOnline}{confirmedHealth}). Starting 10s recovery cycle.");
                 SetStatus(TailscaleConnectionPhase.Reconnecting, I18n.Tr(
                     "ПЕРЕПОДКЛЮЧЕНИЕ · Соединение потеряно, проверяю сеть и маршруты…",
                     "RECONNECTING · Connection lost, probing network routes…"));
@@ -839,6 +941,8 @@ public sealed class TailscaleConnectionManager : IDisposable
             var timeoutMsg = I18n.Tr(
                 "Превышено время ожидания ответа от Tailscale. Повтор через 10 сек…",
                 "Timed out waiting for Tailscale to come online. Retrying in 10s…");
+            ErrorLog.WriteMessage("TailscaleConnectionManager.Reconcile",
+                $"Recovery attempt timed out (40s). ActiveRoute={_activeRoute?.DisplayName ?? "none"}.");
             _service.MarkOffline(timeoutMsg);
             if (!_shutdownStarted && !_disposed && _settings.TailscaleFunnelEnabled)
             {
@@ -849,6 +953,7 @@ public sealed class TailscaleConnectionManager : IDisposable
         }
         catch (Exception exception)
         {
+            ErrorLog.Write("TailscaleConnectionManager.Reconcile", exception);
             _service.MarkOffline(exception.Message);
             if (!_shutdownStarted && !_disposed && _settings.TailscaleFunnelEnabled)
             {
@@ -873,13 +978,57 @@ public sealed class TailscaleConnectionManager : IDisposable
         var routeSuffix = route.Kind switch
         {
             TailscaleRouteKind.Direct => I18n.Tr("напрямую", "direct"),
-            TailscaleRouteKind.DirectTlsSplit => I18n.Tr("напрямую · обход DPI (TLS)", "direct · DPI-safe (TLS)"),
+            TailscaleRouteKind.DirectTlsRecordVer => I18n.Tr("напрямую · обход DPI (TLS)", "direct · DPI-safe (TLS)"),
+            TailscaleRouteKind.DirectTlsSplit => I18n.Tr("напрямую · обход DPI (TLS-split)", "direct · DPI-safe (TLS-split)"),
             TailscaleRouteKind.DirectTcpSplit => I18n.Tr("напрямую · обход DPI (TCP)", "direct · DPI-safe (TCP)"),
             _ => route.DisplayName
         };
         return I18n.Tr(
             $"ПОДКЛЮЧЕНО · Публичный HTTPS-туннель активен ({routeSuffix}).",
             $"CONNECTED · Public HTTPS tunnel is active ({routeSuffix}).");
+    }
+
+    private (long Seq, string RouteKey, string Reason) SnapshotControlplaneFailure()
+    {
+        lock (_sync)
+            return (_controlplaneFailureSeq, _controlplaneFailureRouteKey, _controlplaneFailureReason);
+    }
+
+    private static bool LooksLikeDaemonBackoffError(string msg)
+    {
+        if (string.IsNullOrWhiteSpace(msg)) return false;
+        return msg.IndexOf("logged out", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               msg.IndexOf("last login error", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               LooksLikeDaemonTransportError(msg);
+    }
+
+    private static bool LooksLikeDaemonTransportError(string msg)
+    {
+        if (string.IsNullOrWhiteSpace(msg)) return false;
+        return msg.IndexOf("unexpected EOF", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               msg.IndexOf("wsarecv", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               msg.IndexOf("deadline exceeded", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               msg.IndexOf("timed out", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               msg.IndexOf("connection refused", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               msg.IndexOf("connection reset", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               msg.IndexOf("proxyconnect", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private void Relay_ControlplaneTunnelFailed(object? sender, TailscaleControlplaneFailureEventArgs e)
+    {
+        if (_disposed || _shutdownStarted) return;
+        lock (_sync)
+        {
+            _controlplaneFailureSeq++;
+            _controlplaneFailureRouteKey = e.Route.Key;
+            _controlplaneFailureReason = e.Reason;
+        }
+
+        if (Phase == TailscaleConnectionPhase.Connected &&
+            _settings.TailscaleFunnelEnabled && _gatewayReady && IsInitialSetupComplete)
+        {
+            ScheduleMonitor(TimeSpan.FromMilliseconds(800));
+        }
     }
 
     private void OnNetworkAddressChanged(object? sender, EventArgs e)
@@ -1063,6 +1212,7 @@ public sealed class TailscaleConnectionManager : IDisposable
         _service.StatusChanged -= Service_StatusChanged;
         _service.FunnelAuthorizationRequired -= Service_FunnelAuthorizationRequired;
         _relay.RouteFailureDetected -= Relay_RouteFailureDetected;
+        _relay.ControlplaneTunnelFailed -= Relay_ControlplaneTunnelFailed;
         _service.Dispose();
         _relay.Dispose();
         _disposed = true;

@@ -363,6 +363,10 @@ function Stop-TailscaleService {
         Stop-Service -Name 'Tailscale' -Force
         (Get-Service -Name 'Tailscale').WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
     }
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    while ((Get-Process -Name 'tailscaled' -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+    }
 }
 
 function Invoke-TailscaleCommand(
@@ -746,15 +750,33 @@ function Set-TailscaleServiceProxy([string]$TargetProxyUrl) {
         $raw = $regKey.GetValue('Environment', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         if ($raw -is [string[]]) { $current = $raw }
 
+        $existingGoDebug = @($current | Where-Object { $_ -match '^(?i)GODEBUG=' } | Select-Object -Last 1)
+        $goDebugTokens = [System.Collections.Generic.List[string]]::new()
+        if ($existingGoDebug.Count -gt 0) {
+            $eqIndex = $existingGoDebug[0].IndexOf('=')
+            if ($eqIndex -ge 0) {
+                $rawVal = $existingGoDebug[0].Substring($eqIndex + 1)
+                foreach ($tok in ($rawVal -split ',')) {
+                    $t = $tok.Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($t) -and $t -notmatch '^(?i)tlsmlkem=') {
+                        $goDebugTokens.Add($t)
+                    }
+                }
+            }
+        }
+        $goDebugTokens.Add('tlsmlkem=0')
+        $goDebugLine = 'GODEBUG=' + ($goDebugTokens -join ',')
+
         $filtered = @($current | Where-Object {
             -not [string]::IsNullOrWhiteSpace($_) -and
-            $_ -notmatch '^(?i)(HTTP_PROXY|HTTPS_PROXY|NO_PROXY)='
+            $_ -notmatch '^(?i)(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|GODEBUG)='
         })
         $next = @(
             $filtered + @(
                 ('HTTP_PROXY=' + $TargetProxyUrl),
                 ('HTTPS_PROXY=' + $TargetProxyUrl),
-                'NO_PROXY=127.0.0.1,localhost,::1'
+                'NO_PROXY=127.0.0.1,localhost,::1',
+                $goDebugLine
             )
         )
         $regKey.SetValue('Environment', [string[]]$next, [Microsoft.Win32.RegistryValueKind]::MultiString)
