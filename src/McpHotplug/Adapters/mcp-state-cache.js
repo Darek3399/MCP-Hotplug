@@ -317,10 +317,13 @@ class McpServerStateCache extends EventEmitter {
     state.pending = false;
     state.isPolling = false;
     const hasMetaPattern = Boolean(toolPolicy.detectMetaPattern(tools));
+    if (catalogChanged && hasMetaPattern) {
+      state.nestedDiscoveryComplete = false;
+    }
     const needsNestedDiscovery = hasMetaPattern && (
       !state.nestedDiscoveryComplete ||
       !state.discoveredNested ||
-      state.discoveredNested.schemaVersion !== 4 ||
+      state.discoveredNested.schemaVersion !== toolPolicy.DISCOVERY_SCHEMA_VERSION ||
       catalogChanged
     );
     if (needsNestedDiscovery) {
@@ -556,7 +559,7 @@ class McpServerStateCache extends EventEmitter {
       if (state.isDiscovering || state.toolsLoadState === 'loading') return false;
       if (state.tools.length === 0) return false;
       const hasMetaPattern = Boolean(toolPolicy.detectMetaPattern(state.tools));
-      if (hasMetaPattern && !state.nestedDiscoveryComplete && (!state.discoveredNested || state.discoveredNested.schemaVersion !== 4)) {
+      if (hasMetaPattern && !state.nestedDiscoveryComplete && (!state.discoveredNested || state.discoveredNested.schemaVersion !== toolPolicy.DISCOVERY_SCHEMA_VERSION)) {
         return false;
       }
       return true;
@@ -646,7 +649,7 @@ class McpServerStateCache extends EventEmitter {
     const isMetaIncomplete = Boolean(
       tree.hasMetaPattern &&
       !state.nestedDiscoveryComplete &&
-      (!state.discoveredNested || state.discoveredNested.schemaVersion !== 4)
+      (!state.discoveredNested || state.discoveredNested.schemaVersion !== toolPolicy.DISCOVERY_SCHEMA_VERSION)
     );
     const isLoadingTools = Boolean(
       state.enabled &&
@@ -660,7 +663,7 @@ class McpServerStateCache extends EventEmitter {
     );
     const effectiveHealth = isLoadingTools
       ? 'loading'
-      : (isLoadError ? 'loading_error' : (allToolsDisabled ? 'offline' : state.health));
+      : (isLoadError ? 'loading_error' : state.health);
     const hideCounts = isLoadingTools || isLoadError;
     const disabledHierarchy = state.enabled && !hideCounts ? toolPolicy.buildCompactDisabledHierarchy(tree) : [];
 

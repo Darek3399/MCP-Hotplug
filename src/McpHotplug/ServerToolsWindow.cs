@@ -218,7 +218,9 @@ public sealed class ServerToolsWindow : Window
 
         _offlineWarningText = new TextBlock
         {
-            Text = I18n.Tr("Все инструменты отключены — сервер перейдёт в статус ОФЛАЙН (нейросеть увидит только список имён).", "All tools are disabled — server will become OFFLINE (the AI will only see tool names)."),
+            Text = I18n.Tr(
+                "Все инструменты отключены — сервер останется в статусе ОНЛАЙН, но активных инструментов будет 0 (модель увидит только список имён).",
+                "All tools are disabled — server stays ONLINE, with 0 active tools (the AI will only see tool names)."),
             Foreground = WarningBrush, FontSize = 11, TextWrapping = TextWrapping.Wrap,
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 14, 0), Visibility = Visibility.Collapsed
         };

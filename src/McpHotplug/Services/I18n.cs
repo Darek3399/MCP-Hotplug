@@ -24,6 +24,7 @@ public static class I18n
         ("Ошибка запуска/проверки MCP: ", "MCP startup/verification error: "),
         ("Ошибка удалённого MCP: ", "Remote MCP error: "),
         ("Некорректный URL: требуется HTTP или HTTPS", "Invalid URL: HTTP or HTTPS is required"),
+        ("Подключён и активен · 0 активных инструментов", "Connected & active · 0 active tools"),
         ("Подключён и активен", "Connected & active"),
         ("Ожидание удалённого MCP: ", "Waiting for remote MCP: "),
         ("Ошибка протокола MCP: ", "MCP protocol error: "),

@@ -139,6 +139,11 @@ public partial class MainWindow : Window
             {
                 FooterStatusText.Text = I18n.Tr("Нет зависимости: Node.js", "Missing dependency: Node.js");
             }
+            if (App.StartMinimizedToTray && !_exitRequested && !_cleanupStarted && !_cleanupCompleted && !IsVisible)
+            {
+                ShowInTaskbar = false;
+                WindowState = WindowState.Minimized;
+            }
         };
     }
 

@@ -17,6 +17,7 @@ public partial class App : System.Windows.Application
     private static RegisteredWaitHandle? _activateRegistration;
 
     internal static bool SkipUpdateCheck { get; private set; }
+    internal static bool StartMinimizedToTray { get; private set; }
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -59,6 +60,10 @@ public partial class App : System.Windows.Application
         AppPaths.EnsureDirectories();
         SkipUpdateCheck = Array.Exists(e.Args, argument =>
             string.Equals(argument, "--skip-update-check", StringComparison.OrdinalIgnoreCase));
+        StartMinimizedToTray = Array.Exists(e.Args, argument =>
+            string.Equals(argument, "--autostart", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(argument, "--minimized", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(argument, "--tray", StringComparison.OrdinalIgnoreCase));
         if (isUpdaterHandoff)
             AppUpdateService.CompleteUpdaterHandoff(e.Args);
         else
@@ -89,8 +94,16 @@ public partial class App : System.Windows.Application
 
         var window = new MainWindow();
         MainWindow = window;
-        window.Show();
-        window.Activate();
+        if (StartMinimizedToTray)
+        {
+            window.ShowInTaskbar = false;
+            window.WindowState = WindowState.Minimized;
+        }
+        else
+        {
+            window.Show();
+            window.Activate();
+        }
     }
 
     private void StartActivationListener()

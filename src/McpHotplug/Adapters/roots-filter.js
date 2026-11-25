@@ -188,8 +188,20 @@ function savePersistedToolTrees() {
   } catch (_) {}
 }
 
+function isPersistableDiscoveredTree(discovered) {
+  if (!discovered || typeof discovered !== 'object' || discovered.pattern === 'none') return false;
+  if (discovered.pattern === 'toolsets') {
+    return Array.isArray(discovered.toolsets) && discovered.toolsets.length > 0;
+  }
+  if (discovered.pattern === 'hotplug') {
+    return Array.isArray(discovered.servers) && discovered.servers.length > 0;
+  }
+  return false;
+}
+
 function hydrateAllPersistedTrees() {
   for (const [serverId, entry] of persistedToolTreesByServer.entries()) {
+    if (!entry || !isPersistableDiscoveredTree(entry.discoveredNested)) continue;
     stateCache.hydratePersistedTree(serverId, entry.tools, entry.discoveredNested);
   }
 }
@@ -204,7 +216,7 @@ function discoverNestedTreeForServer(serverId, force = false) {
   if (!cached || !worker || !cached.enabled || cached.temporary) return Promise.resolve(null);
   if (cached.health !== 'online' || !Array.isArray(cached.tools) || cached.tools.length === 0) return Promise.resolve(null);
   if (!toolPolicy.detectMetaPattern(cached.tools)) return Promise.resolve(null);
-  if (!force && nestedDiscoveryDoneSession.has(id) && cached.discoveredNested && cached.discoveredNested.schemaVersion === 4) {
+  if (!force && nestedDiscoveryDoneSession.has(id) && cached.discoveredNested && cached.discoveredNested.schemaVersion === toolPolicy.DISCOVERY_SCHEMA_VERSION) {
     return Promise.resolve(cached.discoveredNested);
   }
 
@@ -215,7 +227,7 @@ function discoverNestedTreeForServer(serverId, force = false) {
         (subToolName, subArgs) => worker.callTool(subToolName, subArgs || {}),
         cached.tools, 0, 5
       );
-      if (discovered) {
+      if (discovered && isPersistableDiscoveredTree(discovered)) {
         stateCache.setDiscoveredNested(id, discovered);
         nestedDiscoveryDoneSession.add(id);
         persistedToolTreesByServer.set(id, {
@@ -224,9 +236,11 @@ function discoverNestedTreeForServer(serverId, force = false) {
           updatedAt: new Date().toISOString()
         });
         savePersistedToolTrees();
-      } else {
+      } else if (discovered && discovered.pattern === 'none') {
         stateCache.setDiscoveredNested(id, null);
         nestedDiscoveryDoneSession.add(id);
+      } else {
+        stateCache.setDiscoveredNested(id, null);
       }
       return discovered;
     } catch (err) {
@@ -2038,16 +2052,19 @@ stateCache.on('changed', event => {
     const internal = stateCache.getInternalServer(event.serverId);
     if (internal && Array.isArray(internal.tools) && internal.tools.length > 0) {
       const existing = persistedToolTreesByServer.get(String(event.serverId)) || {};
+      const validNested = isPersistableDiscoveredTree(internal.discoveredNested)
+        ? internal.discoveredNested
+        : (isPersistableDiscoveredTree(existing.discoveredNested) ? existing.discoveredNested : null);
       persistedToolTreesByServer.set(String(event.serverId), {
         tools: internal.tools,
-        discoveredNested: internal.discoveredNested || existing.discoveredNested || null,
+        discoveredNested: validNested,
         updatedAt: new Date().toISOString()
       });
       savePersistedToolTrees();
       if (toolPolicy.detectMetaPattern(internal.tools) &&
           internal.toolsLoadState === 'loading' &&
           !nestedDiscoveryPromises.has(String(event.serverId))) {
-        void discoverNestedTreeForServer(event.serverId, false);
+        void discoverNestedTreeForServer(event.serverId, Boolean(event.catalogChanged));
       }
     }
   }
@@ -2242,7 +2259,7 @@ const server = http.createServer(async (req, res) => {
       if (internal && internal.enabled && internal.health === 'online' &&
           toolPolicy.detectMetaPattern(internal.tools) &&
           internal.toolsLoadState !== 'error' &&
-          (!nestedDiscoveryDoneSession.has(serverId) || !internal.discoveredNested || internal.discoveredNested.schemaVersion !== 4) &&
+          (!nestedDiscoveryDoneSession.has(serverId) || !internal.discoveredNested || internal.discoveredNested.schemaVersion !== toolPolicy.DISCOVERY_SCHEMA_VERSION) &&
           !nestedDiscoveryPromises.has(serverId)) {
         void discoverNestedTreeForServer(serverId, false);
       }

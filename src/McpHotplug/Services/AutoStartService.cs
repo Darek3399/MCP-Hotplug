@@ -25,7 +25,7 @@ public static class AutoStartService
             key.DeleteValue(LegacyBridgeValueName, false);
             if (!string.IsNullOrWhiteSpace(executablePath) && string.IsNullOrWhiteSpace(key.GetValue(ValueName) as string))
             {
-                key.SetValue(ValueName, "\"" + executablePath + "\"", RegistryValueKind.String);
+                key.SetValue(ValueName, "\"" + executablePath + "\" --autostart", RegistryValueKind.String);
             }
         }
 

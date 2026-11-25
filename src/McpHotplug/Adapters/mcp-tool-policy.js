@@ -1,5 +1,7 @@
 'use strict';
 
+const DISCOVERY_SCHEMA_VERSION = 5;
+
 const HOTPLUG_CONTROL_SERVER_ID = 'hotplug_control';
 const HOTPLUG_CONTROL_MANAGE_TOOL = 'manage_tools';
 const HOTPLUG_CONTROL_LIST_TOOL = 'list_tools';
@@ -43,6 +45,17 @@ function formatDisabledToolsetsFooter(disabledNames, canSelfManage = false) {
 const ACTION_PARAM_NAMES = ['action', 'command', 'operation', 'subcommand', 'sub_action'];
 const TOOLSET_ROOT_SEGMENT = '__toolsets__';
 const HOTPLUG_ROOT_SEGMENT = '__hotplug__';
+
+const SKIP_TRAVERSE_KEYS = new Set([
+  'inputSchema', 'input_schema', 'outputSchema', 'output_schema',
+  'parameters', 'annotations', '_meta', 'disabled_tools', 'disabled_tools_note',
+  'disabled_toolsets', '$schema', 'examples', 'errors', 'error', 'warnings', 'warning'
+]);
+
+const ANONYMOUS_WRAPPER_HINTS = new Set([
+  'result', 'data', 'payload', 'response', 'categories', 'subcategories',
+  'groups', 'children', 'items', 'entries', 'list', 'tools', 'toolsets', 'servers'
+]);
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -113,6 +126,14 @@ function isPathDisabled(nodePath, disabledSet) {
   return false;
 }
 
+function normalizeStringOrArray(value) {
+  if (typeof value === 'string' && value.trim()) return [value.trim()];
+  if (Array.isArray(value)) {
+    return value.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim());
+  }
+  return [];
+}
+
 function extractSchemaSubActions(tool) {
   const schema = isPlainObject(tool && tool.inputSchema) ? tool.inputSchema : null;
   if (!schema) return null;
@@ -159,46 +180,248 @@ function extractSchemaSubActions(tool) {
   return null;
 }
 
-function detectMetaPattern(tools) {
-  const safeTools = Array.isArray(tools) ? tools : [];
-  const names = new Set(safeTools.filter(t => t && typeof t.name === 'string').map(t => t.name));
-
-  if (names.has('list_toolsets') && names.has('describe_toolset')) {
-    const callToolName = names.has('call_tool')
-      ? 'call_tool'
-      : (names.has('execute_tool') ? 'execute_tool' : (names.has('run_tool') ? 'run_tool' : null));
-    if (callToolName) {
-      const descTool = safeTools.find(t => t && t.name === 'describe_toolset');
-      const descProps = isPlainObject(descTool && descTool.inputSchema && descTool.inputSchema.properties)
-        ? descTool.inputSchema.properties
-        : null;
-      let describeParamName = 'toolset_name';
-      if (descProps) {
-        if ('toolset_name' in descProps) describeParamName = 'toolset_name';
-        else if ('toolset' in descProps) describeParamName = 'toolset';
-        else if ('name' in descProps) describeParamName = 'name';
-        else {
-          const firstKey = Object.keys(descProps)[0];
-          if (firstKey) describeParamName = firstKey;
-        }
+// ----------------------------------------------------------------------------
+// JSON Schema introspection (Draft 2020-12 & Pydantic v2 anyOf/oneOf nullable)
+// ----------------------------------------------------------------------------
+function unwrapNullableSchema(prop) {
+  if (!isPlainObject(prop)) return prop;
+  for (const unionKey of ['anyOf', 'oneOf']) {
+    if (Array.isArray(prop[unionKey]) && prop[unionKey].length > 0) {
+      const nonNull = prop[unionKey].filter(b => isPlainObject(b) && b.type !== 'null');
+      if (nonNull.length === 1) {
+        return unwrapNullableSchema(nonNull[0]);
       }
-      return {
-        type: 'toolsets',
-        listTool: 'list_toolsets',
-        describeTool: 'describe_toolset',
-        describeParamName,
-        callTool: callToolName,
-        metaTools: new Set(['list_toolsets', 'describe_toolset', callToolName])
-      };
     }
   }
+  if (Array.isArray(prop.type)) {
+    const nonNullTypes = prop.type.filter(t => t !== 'null');
+    if (nonNullTypes.length === 1) {
+      return { ...prop, type: nonNullTypes[0] };
+    }
+  }
+  return prop;
+}
 
-  if (names.has('all_tools') && names.has('call_tool')) {
+function getSchemaProps(tool) {
+  const s = isPlainObject(tool && tool.inputSchema) ? tool.inputSchema : null;
+  return s && isPlainObject(s.properties) ? s.properties : {};
+}
+
+function getSchemaRequired(tool) {
+  const s = isPlainObject(tool && tool.inputSchema) ? tool.inputSchema : null;
+  return s && Array.isArray(s.required) ? s.required.filter(x => typeof x === 'string') : [];
+}
+
+function getPropTypes(rawProp) {
+  const u = unwrapNullableSchema(rawProp);
+  if (!isPlainObject(u) || u.type === undefined) return [];
+  return Array.isArray(u.type) ? u.type : [u.type];
+}
+
+function isOpenObjectSchema(rawProp) {
+  const prop = unwrapNullableSchema(rawProp);
+  if (!isPlainObject(prop)) return false;
+  if (!getPropTypes(prop).includes('object')) return false;
+  const hasExplicitProps = isPlainObject(prop.properties) && Object.keys(prop.properties).length > 0;
+  if (hasExplicitProps) return false;
+  if (prop.additionalProperties === false) return false;
+  return true;
+}
+
+function isFreeStringSchema(rawProp) {
+  const prop = unwrapNullableSchema(rawProp);
+  if (!isPlainObject(prop)) return false;
+  if (!getPropTypes(prop).includes('string')) return false;
+  if (Array.isArray(prop.enum) && prop.enum.length > 0) return false;
+  if (prop.const !== undefined) return false;
+  return true;
+}
+
+function isStringArraySchema(rawProp) {
+  const prop = unwrapNullableSchema(rawProp);
+  if (!isPlainObject(prop)) return false;
+  if (!getPropTypes(prop).includes('array')) return false;
+  return isFreeStringSchema(prop.items);
+}
+
+function isSimpleScalarSchema(rawProp) {
+  const prop = unwrapNullableSchema(rawProp);
+  if (!isPlainObject(prop)) return false;
+  const types = getPropTypes(prop);
+  return types.some(t => ['boolean', 'string', 'integer', 'number'].includes(t));
+}
+
+function isReadOnlyTool(tool) {
+  return Boolean(tool && isPlainObject(tool.annotations) && tool.annotations.readOnlyHint === true);
+}
+
+function isNonMutatingCandidate(tool) {
+  const a = tool && isPlainObject(tool.annotations) ? tool.annotations : null;
+  if (!a) return true;
+  if (a.destructiveHint === true) return false;
+  if (a.readOnlyHint === false) return false;
+  return true;
+}
+
+// ----------------------------------------------------------------------------
+// Universal schema-driven meta-MCP role detection (zero hardcoded tool names)
+// ----------------------------------------------------------------------------
+function detectMetaPattern(tools) {
+  const safeTools = Array.isArray(tools)
+    ? tools.filter(t => isPlainObject(t) && typeof t.name === 'string' && t.name.trim())
+    : [];
+  if (safeTools.length < 2) return null;
+
+  // Step A: Find proxy dispatcher (executor) by invariant schema signature:
+  // - Not readOnlyHint: true
+  // - Exactly 1 open-object parameter (arbitrary argument bag)
+  // - At least 1 required free-string parameter (target tool identifier)
+  // - Remaining parameters are free strings or optional simple scalars
+  const dispatchers = [];
+  for (const t of safeTools) {
+    if (isReadOnlyTool(t)) continue;
+    const props = getSchemaProps(t);
+    const entries = Object.entries(props);
+    if (entries.length < 2 || entries.length > 8) continue;
+
+    const reqSet = new Set(getSchemaRequired(t));
+    const openObjParams = [];
+    const stringParams = [];
+    let valid = true;
+
+    for (const [k, prop] of entries) {
+      if (isOpenObjectSchema(prop)) {
+        openObjParams.push(k);
+      } else if (isFreeStringSchema(prop)) {
+        stringParams.push({ name: k, required: reqSet.has(k) });
+      } else if (!reqSet.has(k) && isSimpleScalarSchema(prop)) {
+        // Optional scalar knobs (e.g. timeout, dry_run, format) are permitted.
+      } else {
+        valid = false;
+        break;
+      }
+    }
+
+    if (!valid || openObjParams.length !== 1 || stringParams.length === 0) continue;
+    if (!stringParams.some(p => p.required)) continue;
+
+    const requiredStrings = stringParams.filter(p => p.required).map(p => p.name);
+    const optionalStrings = stringParams.filter(p => !p.required).map(p => p.name);
+    dispatchers.push({
+      name: t.name,
+      argsParam: openObjParams[0],
+      stringParams,
+      toolParam: requiredStrings[0],
+      groupParam: optionalStrings[0] || (requiredStrings.length >= 2 ? requiredStrings[1] : null)
+    });
+  }
+
+  if (dispatchers.length === 0) return null;
+  const dispatcher = dispatchers[0];
+
+  // Step B: Find 0-required-param lister candidates
+  const listers = [];
+  for (const t of safeTools) {
+    if (t.name === dispatcher.name) continue;
+    if (!isNonMutatingCandidate(t)) continue;
+    if (getSchemaRequired(t).length !== 0) continue;
+    const propEntries = Object.entries(getSchemaProps(t));
+    if (propEntries.length > 3) continue;
+    if (propEntries.some(([, p]) => isOpenObjectSchema(p) || !isSimpleScalarSchema(p))) continue;
+    listers.push({
+      name: t.name,
+      propCount: propEntries.length,
+      readOnly: isReadOnlyTool(t)
+    });
+  }
+  listers.sort((a, b) => (a.propCount - b.propCount) || (b.readOnly - a.readOnly));
+
+  // Step C: Find 1-required-param inspector / search candidates (string or string[])
+  const inspectors = [];
+  for (const t of safeTools) {
+    if (t.name === dispatcher.name) continue;
+    if (!isNonMutatingCandidate(t)) continue;
+    const req = getSchemaRequired(t);
+    if (req.length !== 1) continue;
+    const props = getSchemaProps(t);
+    const targetName = req[0];
+    const targetProp = props[targetName];
+    const isArray = isStringArraySchema(targetProp);
+    const isScalar = isFreeStringSchema(targetProp);
+    if (!isArray && !isScalar) continue;
+
+    const optionalParams = [];
+    let ok = true;
+    for (const [k, p] of Object.entries(props)) {
+      if (k === targetName) continue;
+      if (isOpenObjectSchema(p) || !isSimpleScalarSchema(p)) {
+        ok = false;
+        break;
+      }
+      optionalParams.push({ name: k, types: getPropTypes(p) });
+    }
+    if (!ok) continue;
+
+    inspectors.push({
+      name: t.name,
+      targetParam: targetName,
+      isArray,
+      optionalParams,
+      hasBooleanOption: optionalParams.some(p => p.types.includes('boolean')),
+      hasIntegerOption: optionalParams.some(p => p.types.includes('integer') || p.types.includes('number')),
+      readOnly: isReadOnlyTool(t)
+    });
+  }
+
+  inspectors.sort((a, b) => (b.hasBooleanOption - a.hasBooleanOption) || (b.readOnly - a.readOnly));
+
+  if (listers.length === 0 && inspectors.length === 0) return null;
+
+  const metaTools = new Set([
+    dispatcher.name,
+    ...listers.map(l => l.name),
+    ...inspectors.map(i => i.name)
+  ]);
+
+  return {
+    type: listers.length === 0 ? 'search' : (inspectors.length > 0 ? 'hierarchical' : 'catalog'),
+    dispatcher,
+    lister: listers[0] || null,
+    listerCandidates: listers,
+    inspectors,
+    metaTools
+  };
+}
+
+function resolveEffectiveMeta(discoveredNested, metaPattern) {
+  if (isPlainObject(discoveredNested) && isPlainObject(discoveredNested.meta)) {
+    const m = discoveredNested.meta;
+    const metaTools = new Set(Array.isArray(m.metaTools) ? m.metaTools.filter(Boolean) : []);
     return {
-      type: 'hotplug',
-      listTool: 'all_tools',
-      callTool: 'call_tool',
-      metaTools: new Set(['all_tools', 'call_tool'])
+      lister: typeof m.lister === 'string' && m.lister ? m.lister : null,
+      dispatcher: isPlainObject(m.dispatcher) ? m.dispatcher : (metaPattern ? metaPattern.dispatcher : null),
+      groupInspector: isPlainObject(m.groupInspector) ? m.groupInspector : null,
+      leafInspector: isPlainObject(m.leafInspector) ? m.leafInspector : null,
+      searchTool: isPlainObject(m.searchTool) ? m.searchTool : null,
+      metaTools
+    };
+  }
+
+  // Backward compatibility with cached schemaVersion <= 4 trees (before reconnect upgrades to v5)
+  if (metaPattern) {
+    const legacyGroup = metaPattern.inspectors && metaPattern.inspectors.length > 0
+      ? metaPattern.inspectors[0]
+      : null;
+    const legacyLeaf = metaPattern.inspectors && metaPattern.inspectors.length > 1
+      ? metaPattern.inspectors[1]
+      : null;
+    return {
+      lister: metaPattern.lister ? metaPattern.lister.name : null,
+      dispatcher: metaPattern.dispatcher,
+      groupInspector: legacyGroup,
+      leafInspector: legacyLeaf,
+      searchTool: null,
+      metaTools: metaPattern.metaTools
     };
   }
 
@@ -368,11 +591,15 @@ function buildNestedDiscoveredNodes(discovered, parentSegments, disabledSet) {
 
     if (toolsetNodes.length === 0) return [];
 
+    const metaLabel = isPlainObject(discovered.meta) && Array.isArray(discovered.meta.metaTools) && discovered.meta.metaTools.length > 0
+      ? discovered.meta.metaTools.join(' / ')
+      : 'list_toolsets / describe_toolset / call_tool';
+
     return [
       finalizeCategoryNode({
         path: joinPath(rootSegments),
         name: 'toolsets',
-        displayName: 'Toolsets (list_toolsets / describe_toolset / call_tool)',
+        displayName: 'Toolsets (' + metaLabel + ')',
         kind: 'category',
         metaType: 'toolset_root',
         description: 'Nested MCP toolsets discovered from this server.',
@@ -388,7 +615,7 @@ function buildNestedDiscoveredNodes(discovered, parentSegments, disabledSet) {
       const srvName = String(srv.name || srvId);
       const srvSegments = [...rootSegments, srvId];
       let children = [];
-      if (srv.nested && isPlainObject(srv.nested)) {
+      if (srv.nested && isPlainObject(srv.nested) && srv.nested.pattern !== 'none') {
         children = buildNestedDiscoveredNodes(srv.nested, srvSegments, disabledSet);
       } else {
         const srvTools = Array.isArray(srv.tools) ? srv.tools : [];
@@ -412,14 +639,18 @@ function buildNestedDiscoveredNodes(discovered, parentSegments, disabledSet) {
 
     if (serverNodes.length === 0) return [];
 
+    const metaLabel = isPlainObject(discovered.meta) && Array.isArray(discovered.meta.metaTools) && discovered.meta.metaTools.length > 0
+      ? discovered.meta.metaTools.join(' / ')
+      : 'all_tools / call_tool';
+
     return [
       finalizeCategoryNode({
         path: joinPath(rootSegments),
         name: 'hotplug',
-        displayName: 'Hotplug Catalog (all_tools / call_tool)',
+        displayName: 'Hotplug Catalog (' + metaLabel + ')',
         kind: 'category',
         metaType: 'hotplug_root',
-        description: 'Nested MCP catalog discovered via all_tools.',
+        description: 'Nested MCP catalog discovered from this server.',
         children: serverNodes
       }, disabledSet)
     ];
@@ -434,18 +665,37 @@ function buildServerToolTree(tools, discoveredNested, disabledList) {
   const metaPattern = detectMetaPattern(safeTools);
   const nodes = [];
 
-  const hasDiscoveredMeta = Boolean(
-    metaPattern &&
+  const hasDiscoveredToolsetItems = Boolean(
     isPlainObject(discoveredNested) &&
-    ((metaPattern.type === 'toolsets' && discoveredNested.pattern === 'toolsets' && Array.isArray(discoveredNested.toolsets) && discoveredNested.toolsets.length > 0) ||
-     (metaPattern.type === 'hotplug' && discoveredNested.pattern === 'hotplug' && Array.isArray(discoveredNested.servers) && discoveredNested.servers.length > 0))
+    discoveredNested.pattern === 'toolsets' &&
+    Array.isArray(discoveredNested.toolsets) &&
+    discoveredNested.toolsets.length > 0
   );
+  const hasDiscoveredHotplugItems = Boolean(
+    isPlainObject(discoveredNested) &&
+    discoveredNested.pattern === 'hotplug' &&
+    Array.isArray(discoveredNested.servers) &&
+    discoveredNested.servers.length > 0
+  );
+  const hasDiscoveredMeta = Boolean(metaPattern && (hasDiscoveredToolsetItems || hasDiscoveredHotplugItems));
+
+  // If discovery already completed at the current schema version and confirmed no nested tools exist,
+  // treat this server as flat so UI and cache never spin waiting for meta discovery.
+  const discoverySettledEmpty = Boolean(
+    isPlainObject(discoveredNested) &&
+    discoveredNested.schemaVersion === DISCOVERY_SCHEMA_VERSION &&
+    !hasDiscoveredMeta &&
+    (discoveredNested.pattern === 'none' || discoveredNested.pattern === 'toolsets' || discoveredNested.pattern === 'hotplug')
+  );
+
+  const effectiveMeta = resolveEffectiveMeta(discoveredNested, metaPattern);
 
   if (hasDiscoveredMeta) {
     nodes.push(...buildNestedDiscoveredNodes(discoveredNested, [], disabledSet));
+    const hiddenMetaTools = effectiveMeta ? effectiveMeta.metaTools : new Set();
     for (const tool of safeTools) {
       if (!tool || typeof tool.name !== 'string' || !tool.name.trim()) continue;
-      if (metaPattern.metaTools.has(tool.name)) continue;
+      if (hiddenMetaTools.has(tool.name)) continue;
       nodes.push(buildLeafOrSchemaNode(tool, [], disabledSet, 'flat'));
     }
   } else {
@@ -475,13 +725,18 @@ function buildServerToolTree(tools, discoveredNested, disabledList) {
   const allDisabled = (totalLeafCount > 0 && enabledLeafCount === 0) ||
     (disabledSet.has('*') && (nodes.length > 0 || safeTools.length > 0));
 
+  const effectiveHasMetaPattern = Boolean(metaPattern) && !discoverySettledEmpty;
+  const effectivePatternType = hasDiscoveredMeta
+    ? discoveredNested.pattern
+    : (effectiveHasMetaPattern ? metaPattern.type : null);
+
   return {
     nodes,
     totalLeafCount,
     enabledLeafCount,
     allDisabled,
-    hasMetaPattern: Boolean(metaPattern),
-    metaPatternType: metaPattern ? metaPattern.type : null,
+    hasMetaPattern: effectiveHasMetaPattern,
+    metaPatternType: effectivePatternType,
     hasDiscoveredMeta,
     discoveredAt: isPlainObject(discoveredNested) ? (discoveredNested.discoveredAt || null) : null
   };
@@ -567,14 +822,15 @@ function filterCatalogToolsForServer(tools, discoveredNested, disabledList) {
   }
 
   const metaPattern = detectMetaPattern(safeTools);
+  const effectiveMeta = resolveEffectiveMeta(discoveredNested, metaPattern);
   const enabledTools = [];
 
   for (const rawTool of safeTools) {
     if (!rawTool || typeof rawTool.name !== 'string' || !rawTool.name.trim()) continue;
     const toolName = rawTool.name;
 
-    if (metaPattern && metaPattern.metaTools.has(toolName) && tree.hasDiscoveredMeta) {
-      const rootSeg = metaPattern.type === 'toolsets' ? TOOLSET_ROOT_SEGMENT : HOTPLUG_ROOT_SEGMENT;
+    if (tree.hasDiscoveredMeta && effectiveMeta && effectiveMeta.metaTools.has(toolName)) {
+      const rootSeg = discoveredNested.pattern === 'hotplug' ? HOTPLUG_ROOT_SEGMENT : TOOLSET_ROOT_SEGMENT;
       const rootNode = tree.nodes.find(n => n.path === rootSeg);
       if (rootNode && !rootNode.enabled && !rootNode.indeterminate) {
         continue;
@@ -620,6 +876,62 @@ function matchToolsetTools(tsObj, requestedTool) {
   );
 }
 
+function isToolsetFullyDisabled(tsName, discoveredNested, disabledSet) {
+  const tsPath = joinPath([TOOLSET_ROOT_SEGMENT, tsName]);
+  if (isPathDisabled(tsPath, disabledSet)) return true;
+  const tsObj = isPlainObject(discoveredNested) && Array.isArray(discoveredNested.toolsets)
+    ? discoveredNested.toolsets.find(t => t && t.name === tsName)
+    : null;
+  const tsTools = tsObj && Array.isArray(tsObj.tools) ? tsObj.tools : [];
+  return tsTools.length > 0 && tsTools.every(t =>
+    isPathDisabled(joinPath(getToolsetToolSegments(tsName, t)), disabledSet)
+  );
+}
+
+function resolveLeafMatches(requestedTool, requestedGroup, discoveredNested) {
+  const toolsets = isPlainObject(discoveredNested) && Array.isArray(discoveredNested.toolsets)
+    ? discoveredNested.toolsets
+    : [];
+  const matches = [];
+  for (const ts of toolsets) {
+    if (requestedGroup && ts.name !== requestedGroup) continue;
+    if (ts.isSingleTool === true && ts.name === requestedTool) {
+      matches.push({ tsName: ts.name, segments: [TOOLSET_ROOT_SEGMENT, ts.name] });
+      continue;
+    }
+    for (const t of matchToolsetTools(ts, requestedTool)) {
+      matches.push({ tsName: ts.name, segments: getToolsetToolSegments(ts.name, t) });
+    }
+  }
+  return matches;
+}
+
+function isLeafToolDisabled(requestedTool, requestedGroup, discoveredNested, disabledSet, nestedArgs = null) {
+  const isLeafOrActionDisabled = (segments) => {
+    if (isPathDisabled(joinPath(segments), disabledSet)) return true;
+    if (isPlainObject(nestedArgs)) {
+      for (const actionParam of ACTION_PARAM_NAMES) {
+        if (typeof nestedArgs[actionParam] === 'string' && nestedArgs[actionParam].trim()) {
+          if (isPathDisabled(joinPath([...segments, nestedArgs[actionParam].trim()]), disabledSet)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  const matches = resolveLeafMatches(requestedTool, requestedGroup, discoveredNested);
+  if (matches.length === 0) {
+    if (requestedGroup) {
+      return isPathDisabled(joinPath([TOOLSET_ROOT_SEGMENT, requestedGroup]), disabledSet) ||
+             isLeafOrActionDisabled([TOOLSET_ROOT_SEGMENT, requestedGroup, requestedTool]);
+    }
+    return false;
+  }
+  return matches.every(m => isLeafOrActionDisabled(m.segments));
+}
+
 function checkToolCallAllowed(toolName, args, tools, discoveredNested, disabledList, options = {}) {
   const safeTools = Array.isArray(tools) ? tools : [];
   const disabledSet = createDisabledSet(disabledList);
@@ -644,110 +956,88 @@ function checkToolCallAllowed(toolName, args, tools, discoveredNested, disabledL
   }
 
   const metaPattern = detectMetaPattern(safeTools);
+  const effectiveMeta = resolveEffectiveMeta(discoveredNested, metaPattern);
 
-  if (metaPattern && metaPattern.type === 'toolsets') {
-    if (isPathDisabled(TOOLSET_ROOT_SEGMENT, disabledSet)) {
-      if (metaPattern.metaTools.has(toolName)) return blocked(toolName);
-    }
-
-    const rootNode = tree.nodes.find(n => n.path === TOOLSET_ROOT_SEGMENT);
-    if (rootNode && !rootNode.enabled && !rootNode.indeterminate && metaPattern.metaTools.has(toolName)) {
+  if (tree.hasDiscoveredMeta && effectiveMeta && discoveredNested.pattern === 'toolsets') {
+    if (isPathDisabled(TOOLSET_ROOT_SEGMENT, disabledSet) && effectiveMeta.metaTools.has(toolName)) {
       return blocked(toolName);
     }
 
-    if (toolName === metaPattern.describeTool) {
-      const descParam = metaPattern.describeParamName || 'toolset_name';
-      const rawRequested = safeArgs[descParam] ?? safeArgs.toolset_name ?? safeArgs.toolset ?? safeArgs.name;
-      const requestedToolset = typeof rawRequested === 'string' ? rawRequested.trim() : '';
-      if (requestedToolset) {
-        const tsPath = joinPath([TOOLSET_ROOT_SEGMENT, requestedToolset]);
-        const tsObj = isPlainObject(discoveredNested) && Array.isArray(discoveredNested.toolsets)
-          ? discoveredNested.toolsets.find(t => t && t.name === requestedToolset)
-          : null;
-        const tsTools = tsObj && Array.isArray(tsObj.tools) ? tsObj.tools : [];
-        const allChildrenDisabled = tsTools.length > 0 && tsTools.every(t =>
-          isPathDisabled(joinPath(getToolsetToolSegments(requestedToolset, t)), disabledSet)
-        );
-        if (isPathDisabled(tsPath, disabledSet) || allChildrenDisabled) {
-          return blocked(requestedToolset);
-        }
+    const rootNode = tree.nodes.find(n => n.path === TOOLSET_ROOT_SEGMENT);
+    if (rootNode && !rootNode.enabled && !rootNode.indeterminate && effectiveMeta.metaTools.has(toolName)) {
+      return blocked(toolName);
+    }
+
+    if (effectiveMeta.groupInspector && toolName === effectiveMeta.groupInspector.name) {
+      const requested = normalizeStringOrArray(safeArgs[effectiveMeta.groupInspector.targetParam]);
+      if (requested.length > 0 && requested.every(g => isToolsetFullyDisabled(g, discoveredNested, disabledSet))) {
+        return blocked(requested.join(', '));
       }
     }
 
-    if (toolName === metaPattern.callTool) {
-      const requestedToolset = typeof safeArgs.toolset_name === 'string' ? safeArgs.toolset_name.trim() : '';
-      const requestedTool = typeof safeArgs.tool_name === 'string'
-        ? safeArgs.tool_name.trim()
-        : (typeof safeArgs.name === 'string' ? safeArgs.name.trim() : '');
-      const nestedArgs = isPlainObject(safeArgs.arguments) ? safeArgs.arguments : {};
+    if (effectiveMeta.leafInspector && toolName === effectiveMeta.leafInspector.name) {
+      const requested = normalizeStringOrArray(safeArgs[effectiveMeta.leafInspector.targetParam]);
+      if (requested.length > 0 && requested.every(t => isLeafToolDisabled(t, '', discoveredNested, disabledSet))) {
+        return blocked(requested.join(', '));
+      }
+    }
 
-      const isLeafOrActionDisabled = (segments) => {
-        if (isPathDisabled(joinPath(segments), disabledSet)) return true;
-        for (const actionParam of ACTION_PARAM_NAMES) {
-          if (typeof nestedArgs[actionParam] === 'string' && nestedArgs[actionParam].trim()) {
-            if (isPathDisabled(joinPath([...segments, nestedArgs[actionParam].trim()]), disabledSet)) {
-              return true;
-            }
-          }
-        }
-        return false;
-      };
+    if (effectiveMeta.dispatcher && toolName === effectiveMeta.dispatcher.name) {
+      const disp = effectiveMeta.dispatcher;
+      const nestedArgs = disp.argsParam && isPlainObject(safeArgs[disp.argsParam]) ? safeArgs[disp.argsParam] : {};
+      const toolsetsList = Array.isArray(discoveredNested.toolsets) ? discoveredNested.toolsets : [];
+      const knownGroups = new Set(toolsetsList.map(t => t.name));
 
-      if (requestedToolset) {
-        const tsPath = joinPath([TOOLSET_ROOT_SEGMENT, requestedToolset]);
-        if (isPathDisabled(tsPath, disabledSet)) {
-          return blocked(requestedToolset + '/' + (requestedTool || '*'));
+      const strVals = (Array.isArray(disp.stringParams) ? disp.stringParams : [])
+        .map(sp => typeof safeArgs[sp.name] === 'string' ? safeArgs[sp.name].trim() : '')
+        .filter(Boolean);
+
+      let reqGroup = '';
+      let reqTool = '';
+      for (const v of strVals) {
+        if (!reqGroup && knownGroups.has(v)) {
+          const tsObj = toolsetsList.find(t => t.name === v);
+          if (tsObj && tsObj.isSingleTool) reqTool = v;
+          else reqGroup = v;
+        } else if (!reqTool) {
+          reqTool = v;
         }
-        if (requestedTool) {
-          if (isLeafOrActionDisabled([TOOLSET_ROOT_SEGMENT, requestedToolset, requestedTool])) {
-            return blocked(requestedToolset + '/' + requestedTool);
-          }
-          const tsObj = isPlainObject(discoveredNested) && Array.isArray(discoveredNested.toolsets)
-            ? discoveredNested.toolsets.find(t => t && t.name === requestedToolset)
-            : null;
-          if (tsObj) {
-            const matched = matchToolsetTools(tsObj, requestedTool);
-            if (matched.length > 0 && matched.every(t => isLeafOrActionDisabled(getToolsetToolSegments(requestedToolset, t)))) {
-              return blocked(requestedToolset + '/' + requestedTool);
-            }
-          }
-        }
-      } else if (requestedTool && isPlainObject(discoveredNested) && Array.isArray(discoveredNested.toolsets)) {
-        // toolset_name is optional in Unreal call_tool; resolve against discovered toolsets.
-        const matches = [];
-        for (const ts of discoveredNested.toolsets) {
-          if (ts.isSingleTool === true && ts.name === requestedTool) {
-            matches.push({ tsName: ts.name, segments: [TOOLSET_ROOT_SEGMENT, ts.name] });
-            continue;
-          }
-          const matchedTools = matchToolsetTools(ts, requestedTool);
-          for (const t of matchedTools) {
-            matches.push({ tsName: ts.name, segments: getToolsetToolSegments(ts.name, t) });
-          }
-        }
-        if (matches.length > 0) {
-          if (matches.every(m => isLeafOrActionDisabled(m.segments))) {
-            return blocked(matches[0].tsName + '/' + requestedTool);
-          }
-        }
+      }
+      if (!reqTool && disp.toolParam && typeof safeArgs[disp.toolParam] === 'string') {
+        reqTool = safeArgs[disp.toolParam].trim();
+      }
+
+      if (reqGroup && isToolsetFullyDisabled(reqGroup, discoveredNested, disabledSet)) {
+        return blocked(reqGroup + '/' + (reqTool || '*'));
+      }
+      if (reqTool && isLeafToolDisabled(reqTool, reqGroup, discoveredNested, disabledSet, nestedArgs)) {
+        const label = reqGroup ? (reqGroup + '/' + reqTool) : reqTool;
+        return blocked(label);
       }
     }
   }
 
-  if (metaPattern && metaPattern.type === 'hotplug') {
-    if (isPathDisabled(HOTPLUG_ROOT_SEGMENT, disabledSet) && metaPattern.metaTools.has(toolName)) {
+  if (tree.hasDiscoveredMeta && effectiveMeta && discoveredNested.pattern === 'hotplug') {
+    if (isPathDisabled(HOTPLUG_ROOT_SEGMENT, disabledSet) && effectiveMeta.metaTools.has(toolName)) {
       return blocked(toolName);
     }
-    if (toolName === 'call_tool' && typeof safeArgs.tool_id === 'string') {
-      const sep = safeArgs.tool_id.indexOf('::');
-      if (sep > 0) {
-        let srvId = safeArgs.tool_id.slice(0, sep);
-        let subTool = safeArgs.tool_id.slice(sep + 2);
-        try { srvId = decodeURIComponent(srvId); } catch (_) {}
-        try { subTool = decodeURIComponent(subTool); } catch (_) {}
-        const targetPath = joinPath([HOTPLUG_ROOT_SEGMENT, srvId, subTool]);
-        if (isPathDisabled(targetPath, disabledSet)) {
-          return blocked(srvId + '/' + subTool);
+    const rootNode = tree.nodes.find(n => n.path === HOTPLUG_ROOT_SEGMENT);
+    if (rootNode && !rootNode.enabled && !rootNode.indeterminate && effectiveMeta.metaTools.has(toolName)) {
+      return blocked(toolName);
+    }
+    if (effectiveMeta.dispatcher && toolName === effectiveMeta.dispatcher.name) {
+      const rawTarget = safeArgs[effectiveMeta.dispatcher.toolParam];
+      if (typeof rawTarget === 'string') {
+        const sep = rawTarget.indexOf('::');
+        if (sep > 0) {
+          let srvId = rawTarget.slice(0, sep);
+          let subTool = rawTarget.slice(sep + 2);
+          try { srvId = decodeURIComponent(srvId); } catch (_) {}
+          try { subTool = decodeURIComponent(subTool); } catch (_) {}
+          const targetPath = joinPath([HOTPLUG_ROOT_SEGMENT, srvId, subTool]);
+          if (isPathDisabled(targetPath, disabledSet)) {
+            return blocked(srvId + '/' + subTool);
+          }
         }
       }
     }
@@ -770,6 +1060,9 @@ function checkToolCallAllowed(toolName, args, tools, discoveredNested, disabledL
   return { allowed: true };
 }
 
+// ----------------------------------------------------------------------------
+// Bottom-up structural JSON + Markdown extractor
+// ----------------------------------------------------------------------------
 function extractJsonFromToolResult(result) {
   if (!isPlainObject(result)) return null;
   if (result.structuredContent !== undefined && result.structuredContent !== null) {
@@ -788,6 +1081,14 @@ function extractJsonFromToolResult(result) {
     } catch (_) {}
   }
   return null;
+}
+
+function getRawTextFromResult(result) {
+  if (!isPlainObject(result) || !Array.isArray(result.content)) return '';
+  return result.content
+    .filter(b => b && b.type === 'text')
+    .map(b => String(b.text || ''))
+    .join('\n');
 }
 
 function writeFilteredJsonToToolResult(originalResult, extracted, filteredData) {
@@ -811,395 +1112,349 @@ function writeFilteredJsonToToolResult(originalResult, extracted, filteredData) 
   return copy;
 }
 
-function parseToolsetsListFromData(data, rawTextFallback = '') {
-  const result = [];
-  const seen = new Set();
+function getToolInputSchema(obj) {
+  if (!isPlainObject(obj)) return null;
+  for (const k of ['inputSchema', 'input_schema', 'parameters']) {
+    const s = obj[k];
+    if (!isPlainObject(s)) continue;
+    if (!isValidInputSchema(s)) continue;
+    return s;
+  }
+  return null;
+}
 
-  function add(name, description = '') {
+function hasStrongLeafMarkers(obj) {
+  if (getToolInputSchema(obj) !== null) return true;
+  if (isPlainObject(obj.outputSchema) || isPlainObject(obj.output_schema)) return true;
+  if (isPlainObject(obj.annotations)) return true;
+  if (typeof obj.tool_id === 'string' && obj.tool_id.trim()) return true;
+  return false;
+}
+
+function hasListCollectionProp(obj) {
+  for (const [k, v] of Object.entries(obj)) {
+    if (SKIP_TRAVERSE_KEYS.has(k)) continue;
+    if (Array.isArray(v)) return true;
+  }
+  return false;
+}
+
+function extractLeavesBottomUp(data) {
+  if (data === null || data === undefined) return [];
+
+  function visit(node, keyFromParent, inArray, depth) {
+    if (depth > 18 || node === null || node === undefined) return [];
+
+    if (Array.isArray(node)) {
+      const collected = [];
+      for (const el of node) {
+        if (isPlainObject(el) || Array.isArray(el)) {
+          collected.push(...visit(el, null, true, depth + 1));
+        }
+      }
+      if (keyFromParent && collected.length > 0) {
+        const isWrapperHint = ANONYMOUS_WRAPPER_HINTS.has(keyFromParent);
+        for (const leaf of collected) {
+          const top = leaf.ancestors[0];
+          const isSameAsLeaf = leaf.ancestors.length === 0 && leaf.name === keyFromParent;
+          if (!isSameAsLeaf && (!top || top.name !== keyFromParent)) {
+            leaf.ancestors.unshift({
+              kind: 'group',
+              name: keyFromParent,
+              description: '',
+              fromKey: true,
+              isWrapperHint
+            });
+          }
+        }
+      }
+      return collected;
+    }
+
+    if (!isPlainObject(node)) return [];
+
+    // Count sibling array-of-objects properties so a single collection prop ("tools"/"ops")
+    // does not pollute the ancestor path, while sibling categorized arrays ({ Math: [...], IO: [...] }) do.
+    const arrayOfObjKeys = [];
+    for (const [k, v] of Object.entries(node)) {
+      if (SKIP_TRAVERSE_KEYS.has(k)) continue;
+      if (Array.isArray(v) && v.some(isPlainObject)) arrayOfObjKeys.push(k);
+    }
+
+    // 1. Descend first (post-order)
+    const descendantLeaves = [];
+    for (const [k, v] of Object.entries(node)) {
+      if (SKIP_TRAVERSE_KEYS.has(k)) continue;
+      if (!v || typeof v !== 'object') continue;
+      const suppressArrayKey = Array.isArray(v) && arrayOfObjKeys.length === 1;
+      descendantLeaves.push(...visit(v, suppressArrayKey ? null : k, false, depth + 1));
+    }
+
+    // 2. Bottom-up: if no descendant leaves were found, check whether this node itself is a leaf tool
+    if (descendantLeaves.length === 0) {
+      const ownName = String(node.name || node.tool_name || node.id || '').trim();
+      const fallbackKey = (keyFromParent && !ANONYMOUS_WRAPPER_HINTS.has(keyFromParent))
+        ? String(keyFromParent).trim()
+        : '';
+      const leafName = ownName || fallbackKey;
+      const strong = hasStrongLeafMarkers(node);
+      const weak = inArray && Boolean(ownName) && typeof node.description === 'string' && !hasListCollectionProp(node);
+
+      if (leafName && (strong || weak) && !hasListCollectionProp(node)) {
+        const ancestors = [];
+        if (isPlainObject(node.source) && typeof node.source.server_id === 'string' && node.source.server_id.trim()) {
+          ancestors.push({
+            kind: 'source',
+            id: node.source.server_id.trim(),
+            name: String(node.source.server_name || node.source.server_id).trim(),
+            description: '',
+            fromKey: false,
+            isWrapperHint: false
+          });
+        }
+        return [{
+          name: leafName,
+          description: String(node.description || ''),
+          inputSchema: getToolInputSchema(node) || {},
+          toolId: typeof node.tool_id === 'string' ? node.tool_id : null,
+          ancestors
+        }];
+      }
+      return [];
+    }
+
+    // 3. Bubble up: prepend this container's identity to all descendant leaves
+    const ownName = String(node.name || node.toolset_name || node.id || '').trim();
+    const keyName = keyFromParent ? String(keyFromParent).trim() : '';
+    const containerName = ownName || keyName;
+    const containerDesc = String(node.description || '');
+    const fromKey = !ownName && Boolean(keyName);
+    const isWrapperHint = fromKey && ANONYMOUS_WRAPPER_HINTS.has(keyName);
+
+    if (containerName) {
+      for (const leaf of descendantLeaves) {
+        const top = leaf.ancestors[0];
+        const isSameAsLeaf = leaf.ancestors.length === 0 && leaf.name === containerName;
+        if (!isSameAsLeaf && (!top || top.name !== containerName)) {
+          leaf.ancestors.unshift({
+            kind: 'group',
+            name: containerName,
+            description: containerDesc,
+            fromKey,
+            isWrapperHint
+          });
+        } else if (top && top.name === containerName) {
+          if (!top.description && containerDesc) top.description = containerDesc;
+          if (!fromKey) {
+            top.fromKey = false;
+            top.isWrapperHint = false;
+          }
+        }
+      }
+    }
+
+    return descendantLeaves;
+  }
+
+  return visit(data, null, false, 0);
+}
+
+function extractNameOnlyLeavesFallback(data, groupName = '') {
+  let stringList = null;
+  if (Array.isArray(data) && data.length > 0 && data.every(x => typeof x === 'string' && x.trim())) {
+    stringList = data;
+  } else if (isPlainObject(data)) {
+    const arrayKeys = Object.entries(data)
+      .filter(([k, v]) => !SKIP_TRAVERSE_KEYS.has(k) && Array.isArray(v) && v.length > 0 && v.every(x => typeof x === 'string' && x.trim()));
+    if (arrayKeys.length === 1) {
+      stringList = arrayKeys[0][1];
+    }
+  }
+  if (!stringList) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of stringList) {
+    const clean = raw.trim();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    const ancestors = groupName
+      ? [{ kind: 'group', name: groupName, description: '', fromKey: false, isWrapperHint: false }]
+      : [];
+    out.push({ name: clean, description: '', inputSchema: {}, toolId: null, ancestors });
+  }
+  return out;
+}
+
+function extractLeavesFromMarkdown(rawText, groupName = '') {
+  if (!rawText) return [];
+  const leaves = [];
+  const seen = new Set();
+  const skipHeaders = new Set([
+    'Tools', 'Toolset', 'Toolsets', 'Parameters', 'Description', 'Schema', 'Arguments', 'Returns', 'Examples'
+  ]);
+  for (const line of String(rawText).split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:[-*+]|\d+\.|#{2,4})\s+`?([A-Za-z0-9_.:-]+)`?(?:\s*\([^)]*\))?(?:\s*[:\-–—]\s*(.*))?$/);
+    if (!m) continue;
+    const name = m[1].trim();
+    if (!name || skipHeaders.has(name) || seen.has(name)) continue;
+    seen.add(name);
+    const ancestors = groupName
+      ? [{ kind: 'group', name: groupName, description: '', fromKey: false, isWrapperHint: false }]
+      : [];
+    leaves.push({ name, description: (m[2] || '').trim(), inputSchema: {}, toolId: null, ancestors });
+  }
+  return leaves;
+}
+
+function extractGroupCandidates(data, rawText) {
+  const out = [];
+  const seen = new Set();
+  const add = (name, desc = '') => {
     const clean = String(name || '').trim();
     if (!clean || seen.has(clean)) return;
     seen.add(clean);
-    result.push({ name: clean, description: String(description || '') });
-  }
+    out.push({ name: clean, description: String(desc || '') });
+  };
 
-  function consumeArray(arr) {
+  function walkArray(arr) {
     for (const item of arr) {
-      if (typeof item === 'string') {
-        add(item, '');
-      } else if (isPlainObject(item)) {
-        const name = item.name || item.toolset_name || item.toolset || item.id || item.title;
-        if (name) add(name, item.description || item.summary || '');
+      if (typeof item === 'string') add(item, '');
+      else if (isPlainObject(item)) {
+        const n = item.name || item.toolset_name || item.toolset || item.group || item.id || item.title;
+        if (n) add(n, item.description || item.summary || '');
       }
     }
   }
 
   if (Array.isArray(data)) {
-    consumeArray(data);
+    walkArray(data);
   } else if (isPlainObject(data)) {
-    const listProp = data.toolsets || data.categories || data.groups || data.items || data.result;
-    if (Array.isArray(listProp)) {
-      consumeArray(listProp);
-    } else if (isPlainObject(listProp)) {
-      for (const [key, val] of Object.entries(listProp)) {
-        add(key, isPlainObject(val) ? (val.description || '') : (typeof val === 'string' ? val : ''));
-      }
-    } else {
-      for (const [key, val] of Object.entries(data)) {
-        if (['status', 'count', 'total', 'disabled_tools_note', 'disabled_tools', 'disabled_toolsets'].includes(key)) continue;
-        if (isPlainObject(val)) add(key, val.description || '');
-        else if (typeof val === 'string') add(key, val);
+    for (const [k, val] of Object.entries(data)) {
+      if (SKIP_TRAVERSE_KEYS.has(k)) continue;
+      if (Array.isArray(val)) {
+        walkArray(val);
+        if (out.length > 0) break;
+      } else if (isPlainObject(val)) {
+        for (const [subK, subV] of Object.entries(val)) {
+          add(subK, isPlainObject(subV) ? (subV.description || '') : (typeof subV === 'string' ? subV : ''));
+        }
+        if (out.length > 0) break;
       }
     }
   }
 
-  if (result.length === 0 && rawTextFallback) {
-    for (const line of String(rawTextFallback).split(/\r?\n/)) {
+  if (out.length === 0 && rawText) {
+    for (const line of String(rawText).split(/\r?\n/)) {
       const m = line.match(/^\s{0,1}(?:[-*+]|\d+\.)\s+`?([A-Za-z0-9_.:-]+)`?(?:\s*[:\-–—]\s*(.*))?$/);
       if (m) add(m[1], m[2] || '');
     }
   }
 
-  return result;
+  return out;
 }
 
-const SKIP_TRAVERSE_KEYS = new Set([
-  'inputSchema', 'input_schema', 'outputSchema', 'output_schema',
-  'parameters', 'annotations', '_meta', 'disabled_tools', 'disabled_tools_note',
-  'disabled_toolsets', 'schema', '$schema', 'tags', 'examples', 'required'
-]);
-const TRANSPARENT_WRAPPER_KEYS = new Set([
-  'result', 'data', 'toolset', 'tools', 'items', 'methods',
-  'actions', 'functions', 'definitions', 'children', 'categories',
-  'groups', 'subcategories', 'entries', 'list'
-]);
-const TOOL_CONTAINER_KEYS = new Set([
-  'tools', 'children', 'methods', 'functions', 'definitions', 'subtools', 'items', 'entries', 'list'
-]);
+function groupLeavesIntoToolsets(leaves, candidateSet = new Set(), descByGroup = new Map()) {
+  const byGroup = new Map();
+  const ungrouped = [];
 
-function getToolInputSchema(obj) {
-  if (!isPlainObject(obj)) return null;
-  if (isPlainObject(obj.inputSchema)) return obj.inputSchema;
-  if (isPlainObject(obj.input_schema)) return obj.input_schema;
-  if (isPlainObject(obj.parameters)) return obj.parameters;
-  return null;
-}
+  for (const leaf of leaves) {
+    let groupName = '';
+    let groupDesc = '';
+    let subPath = [];
 
-function hasNestedToolObjects(obj) {
-  for (const key of TOOL_CONTAINER_KEYS) {
-    const val = obj[key];
-    if (Array.isArray(val) && val.some(isPlainObject)) return true;
-    if (isPlainObject(val) && Object.values(val).some(isPlainObject)) return true;
-  }
-  return false;
-}
-
-function parseToolsetToolsFromData(data, rawTextFallback = '', rootName = '') {
-  const result = [];
-  const seen = new Set();
-
-  function addTool(raw, subPath = [], fallbackName = '') {
-    if (typeof raw === 'string') {
-      const clean = raw.trim();
-      if (!clean || seen.has(clean)) return;
-      seen.add(clean);
-      const cleanSubPath = subPath.filter(s => s && s !== rootName && s !== clean);
-      const entry = { name: clean, description: '', inputSchema: {} };
-      if (cleanSubPath.length > 0) entry.subPath = cleanSubPath;
-      result.push(entry);
-      return;
-    }
-    if (!isPlainObject(raw)) return;
-    const name = String(raw.name || raw.tool_name || raw.id || fallbackName || '').trim();
-    if (!name || seen.has(name)) return;
-    const schema = getToolInputSchema(raw);
-    seen.add(name);
-    const cleanSubPath = subPath.filter(s => s && s !== rootName && s !== name);
-    const entry = {
-      name,
-      description: String(raw.description || ''),
-      inputSchema: schema || {}
-    };
-    if (cleanSubPath.length > 0) entry.subPath = cleanSubPath;
-    result.push(entry);
-  }
-
-  function walk(node, ancestorPath, depth) {
-    if (depth > 16 || node === null || node === undefined) return;
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        if (isPlainObject(item) || Array.isArray(item)) {
-          walk(item, ancestorPath, depth + 1);
-        }
-      }
-      return;
-    }
-
-    if (!isPlainObject(node)) return;
-
-    const schema = getToolInputSchema(node);
-    const ownName = String(node.name || node.tool_name || node.id || '').trim();
-    const containsNestedTools = hasNestedToolObjects(node);
-
-    // Bottom-up leaf rule: a named object with a valid inputSchema and no nested tool objects is a leaf tool.
-    if (ownName && schema && !containsNestedTools) {
-      addTool(node, ancestorPath);
-      return;
-    }
-
-    const nextBasePath = (ownName && ownName !== rootName && ancestorPath[ancestorPath.length - 1] !== ownName)
-      ? [...ancestorPath, ownName]
-      : ancestorPath;
-
-    const beforeCount = result.length;
-    for (const [key, val] of Object.entries(node)) {
-      if (SKIP_TRAVERSE_KEYS.has(key)) continue;
-      if (!val || typeof val !== 'object') continue;
-      const nextPath = TRANSPARENT_WRAPPER_KEYS.has(key)
-        ? nextBasePath
-        : [...nextBasePath, key];
-      if (isPlainObject(val) && getToolInputSchema(val) && !val.name && !val.tool_name && !val.id) {
-        addTool(val, nextBasePath, key);
+    // Anchor to the ancestor matching a real lister candidate -> automatically peels any arbitrary root wrapper
+    const anchorIdx = leaf.ancestors.findIndex(a => candidateSet.has(a.name));
+    if (anchorIdx >= 0) {
+      groupName = leaf.ancestors[anchorIdx].name;
+      groupDesc = leaf.ancestors[anchorIdx].description || descByGroup.get(groupName) || '';
+      subPath = leaf.ancestors
+        .slice(anchorIdx + 1)
+        .filter(a => !a.isWrapperHint && a.name !== groupName && a.name !== leaf.name)
+        .map(a => a.name);
+    } else {
+      const meaningful = leaf.ancestors.filter(a => !a.isWrapperHint);
+      if (meaningful.length > 0) {
+        groupName = meaningful[0].name;
+        groupDesc = meaningful[0].description || descByGroup.get(groupName) || '';
+        subPath = meaningful.slice(1).map(a => a.name).filter(s => s && s !== groupName && s !== leaf.name);
       } else {
-        walk(val, nextPath, depth + 1);
+        ungrouped.push(leaf);
+        continue;
       }
     }
 
-    if (result.length === beforeCount && ownName && schema) {
-      addTool(node, ancestorPath);
+    if (!byGroup.has(groupName)) {
+      byGroup.set(groupName, { name: groupName, description: groupDesc, tools: [], seenTools: new Set() });
     }
+    const entry = byGroup.get(groupName);
+    if (!entry.description && groupDesc) entry.description = groupDesc;
+    if (entry.seenTools.has(leaf.name)) continue;
+    entry.seenTools.add(leaf.name);
+
+    const toolObj = {
+      name: leaf.name,
+      description: leaf.description,
+      inputSchema: leaf.inputSchema || {}
+    };
+    if (subPath.length > 0) toolObj.subPath = subPath;
+    if (isExecutableTool(toolObj)) entry.tools.push(toolObj);
   }
 
-  if (data !== null && data !== undefined) {
-    walk(data, [], 0);
-    // Fallback for name-only JSON tool lists (e.g. { tools: ["foo", "bar"] } or ["foo", "bar"])
-    if (result.length === 0) {
-      let stringList = null;
-      if (Array.isArray(data) && data.every(x => typeof x === 'string')) {
-        stringList = data;
-      } else if (isPlainObject(data)) {
-        const container = isPlainObject(data.toolset) ? data.toolset : (isPlainObject(data.data) ? data.data : (isPlainObject(data.result) ? data.result : data));
-        for (const key of TOOL_CONTAINER_KEYS) {
-          if (Array.isArray(container[key]) && container[key].length > 0 && container[key].every(x => typeof x === 'string')) {
-            stringList = container[key];
-            break;
-          }
-        }
+  const toolsets = [...byGroup.values()]
+    .filter(g => g.tools.length > 0)
+    .map(g => {
+      if (g.tools.length === 1 && g.tools[0].name === g.name) {
+        return {
+          name: g.name,
+          description: g.tools[0].description || g.description,
+          isSingleTool: true,
+          inputSchema: g.tools[0].inputSchema || {},
+          tools: []
+        };
       }
-      if (stringList) {
-        for (const s of stringList) addTool(s, []);
-      }
-    }
-  } else if (rawTextFallback) {
-    for (const line of String(rawTextFallback).split(/\r?\n/)) {
-      const m = line.match(/^\s*(?:[-*+]|\d+\.|##+)\s+`?([A-Za-z0-9_.:-]+)`?(?:\s*[:\-–—]\s*(.*))?$/);
-      if (m && !['Tools', 'Toolset', 'Parameters', 'Description', 'Schema'].includes(m[1])) {
-        addTool({ name: m[1], description: m[2] || '' });
-      }
-    }
+      return { name: g.name, description: g.description, tools: g.tools };
+    });
+
+  const seenUngrouped = new Set();
+  for (const leaf of ungrouped) {
+    if (seenUngrouped.has(leaf.name)) continue;
+    seenUngrouped.add(leaf.name);
+    const single = {
+      name: leaf.name,
+      description: leaf.description,
+      isSingleTool: true,
+      inputSchema: leaf.inputSchema || {},
+      tools: []
+    };
+    if (isExecutableTool(single)) toolsets.push(single);
   }
 
-  return result;
+  return toolsets;
 }
 
+// ----------------------------------------------------------------------------
+// Key-agnostic response filtering (JSON + Markdown)
+// ----------------------------------------------------------------------------
 function filterToolCallResponse(toolName, args, result, tools, discoveredNested, disabledList, options = {}) {
   if (!isPlainObject(result) || result.isError === true) return result;
   const safeTools = Array.isArray(tools) ? tools : [];
   const metaPattern = detectMetaPattern(safeTools);
-  if (!metaPattern) return result;
+  const effectiveMeta = resolveEffectiveMeta(discoveredNested, metaPattern);
+  if (!effectiveMeta || !isPlainObject(discoveredNested) || discoveredNested.pattern === 'none') {
+    return result;
+  }
 
   const disabledSet = createDisabledSet(disabledList);
-  const safeArgs = isPlainObject(args) ? args : {};
+  if (disabledSet.size === 0) return result;
+
   const extracted = extractJsonFromToolResult(result);
   const canSelfManage = Boolean(options && options.canSelfManage);
   const disabledNote = getDisabledToolsNote(canSelfManage);
 
-  if (metaPattern.type === 'toolsets' && toolName === metaPattern.listTool) {
-    const knownToolsetNames = new Set(
-      isPlainObject(discoveredNested) && Array.isArray(discoveredNested.toolsets)
-        ? discoveredNested.toolsets.map(t => t && String(t.name || '').trim()).filter(Boolean)
-        : []
-    );
-
-    const isToolsetDisabled = (tsName) => {
-      const tsPath = joinPath([TOOLSET_ROOT_SEGMENT, tsName]);
-      const tsObj = isPlainObject(discoveredNested) && Array.isArray(discoveredNested.toolsets)
-        ? discoveredNested.toolsets.find(t => t && t.name === tsName)
-        : null;
-      const tsTools = tsObj && Array.isArray(tsObj.tools) ? tsObj.tools : [];
-      const allChildrenDisabled = tsTools.length > 0 && tsTools.every(t =>
-        isPathDisabled(joinPath(getToolsetToolSegments(tsName, t)), disabledSet)
-      );
-      if (isPathDisabled(tsPath, disabledSet) || allChildrenDisabled) {
-        return { disabled: true, tsTools };
-      }
-      return { disabled: false, tsTools };
-    };
-
-    if (!extracted) {
-      const content = Array.isArray(result.content) ? result.content : [];
-      const textIdx = content.findIndex(b => b && b.type === 'text' && typeof b.text === 'string' && b.text.trim());
-      if (textIdx < 0) return result;
-      const rawText = content[textIdx].text;
-      const lines = rawText.split(/\r?\n/);
-      const keptLines = [];
-      const disabledNames = [];
-      let skippingCurrent = false;
-      let matchedAny = false;
-
-      for (const line of lines) {
-        const m = line.match(/^\s{0,1}(?:[-*+]|\d+\.)\s+`?([A-Za-z0-9_.:-]+)`?(?:\s*[:\-–—]\s*(.*))?$/);
-        const candidateName = m ? m[1].trim() : '';
-        const isKnownHeader = Boolean(
-          candidateName &&
-          (knownToolsetNames.size === 0 ||
-            knownToolsetNames.has(candidateName) ||
-            disabledSet.has(joinPath([TOOLSET_ROOT_SEGMENT, candidateName])))
-        );
-        if (isKnownHeader) {
-          matchedAny = true;
-          const check = isToolsetDisabled(candidateName);
-          if (check.disabled) {
-            skippingCurrent = true;
-            disabledNames.push(candidateName);
-          } else {
-            skippingCurrent = false;
-            keptLines.push(line);
-          }
-        } else if (!skippingCurrent) {
-          keptLines.push(line);
-        }
-      }
-
-      if (!matchedAny || disabledNames.length === 0) return result;
-      const copy = cloneJson(result);
-      const footer = formatDisabledToolsetsFooter(disabledNames, canSelfManage);
-      copy.content[textIdx] = {
-        ...copy.content[textIdx],
-        type: 'text',
-        text: keptLines.join('\n').trim() + footer
-      };
-      return copy;
-    }
-
-    const data = extracted.data;
-    const disabledToolsets = [];
-    const filterEntry = (entry) => {
-      const tsName = typeof entry === 'string'
-        ? entry
-        : (isPlainObject(entry) ? String(entry.name || entry.toolset_name || entry.id || '') : '');
-      if (!tsName) return true;
-      const check = isToolsetDisabled(tsName);
-      if (check.disabled) {
-        if (check.tsTools.length > 0) {
-          disabledToolsets.push({ [tsName]: check.tsTools.map(t => t.name) });
-        } else {
-          disabledToolsets.push(tsName);
-        }
-        return false;
-      }
-      return true;
-    };
-
-    let filteredPayload;
-    if (Array.isArray(data)) {
-      const enabled = data.filter(filterEntry);
-      filteredPayload = {
-        toolsets: enabled,
-        ...(disabledToolsets.length > 0 ? { disabled_tools: disabledToolsets } : {}),
-        disabled_tools_note: disabledNote
-      };
-    } else if (isPlainObject(data)) {
-      filteredPayload = cloneJson(data);
-      for (const key of ['toolsets', 'categories', 'groups', 'items']) {
-        if (Array.isArray(filteredPayload[key])) {
-          filteredPayload[key] = filteredPayload[key].filter(filterEntry);
-          break;
-        }
-      }
-      if (disabledToolsets.length > 0) {
-        filteredPayload.disabled_tools = disabledToolsets;
-      }
-      filteredPayload.disabled_tools_note = disabledNote;
-    } else {
-      return result;
-    }
-
-    return writeFilteredJsonToToolResult(result, extracted, filteredPayload);
-  }
-
-  if (!extracted) return result;
-
-  if (metaPattern.type === 'toolsets' && toolName === metaPattern.describeTool) {
-    const descParam = metaPattern.describeParamName || 'toolset_name';
-    const rawTs = safeArgs[descParam] ?? safeArgs.toolset_name ?? safeArgs.toolset ?? safeArgs.name;
-    const tsName = typeof rawTs === 'string' ? rawTs.trim() : '';
-    if (!tsName) return result;
-
-    const tsObj = isPlainObject(discoveredNested) && Array.isArray(discoveredNested.toolsets)
-      ? discoveredNested.toolsets.find(t => t && t.name === tsName)
-      : null;
-
-    const data = extracted.data;
-    const disabledNames = [];
-    const filterToolItem = (item) => {
-      const name = typeof item === 'string'
-        ? item
-        : (isPlainObject(item) ? String(item.name || item.tool_name || item.id || '') : '');
-      if (!name) return item;
-      const matched = tsObj ? matchToolsetTools(tsObj, name)[0] : null;
-      const leafPath = matched
-        ? joinPath(getToolsetToolSegments(tsName, matched))
-        : joinPath([TOOLSET_ROOT_SEGMENT, tsName, name]);
-      if (isPathDisabled(leafPath, disabledSet)) {
-        disabledNames.push(name);
-        return null;
-      }
-      if (isPlainObject(item)) {
-        const pruned = pruneSchemaForDisabledActions(item, leafPath, disabledSet);
-        if (!pruned) {
-          disabledNames.push(name);
-          return null;
-        }
-        return pruned;
-      }
-      return item;
-    };
-
-    let filteredPayload;
-    if (Array.isArray(data)) {
-      const enabled = data.map(filterToolItem).filter(Boolean);
-      filteredPayload = {
-        toolset_name: tsName,
-        tools: enabled,
-        ...(disabledNames.length > 0 ? { disabled_tools: disabledNames } : {}),
-        disabled_tools_note: disabledNote
-      };
-    } else if (isPlainObject(data)) {
-      filteredPayload = cloneJson(data);
-      const container = isPlainObject(filteredPayload.toolset) ? filteredPayload.toolset : filteredPayload;
-      for (const key of ['tools', 'items', 'methods', 'actions', 'functions']) {
-        if (Array.isArray(container[key])) {
-          container[key] = container[key].map(filterToolItem).filter(Boolean);
-          break;
-        }
-      }
-      if (disabledNames.length > 0) {
-        filteredPayload.disabled_tools = disabledNames;
-      }
-      filteredPayload.disabled_tools_note = disabledNote;
-    } else {
-      return result;
-    }
-
-    return writeFilteredJsonToToolResult(result, extracted, filteredPayload);
-  }
-
-  if (metaPattern.type === 'hotplug' && toolName === 'all_tools') {
-    const data = extracted.data;
-    if (!isPlainObject(data) || !Array.isArray(data.tools)) return result;
-
-    const filteredPayload = cloneJson(data);
+  // Hotplug catalog lister response filtering
+  if (discoveredNested.pattern === 'hotplug' && effectiveMeta.lister && toolName === effectiveMeta.lister) {
+    if (!extracted || !isPlainObject(extracted.data) || !Array.isArray(extracted.data.tools)) return result;
+    const filteredPayload = cloneJson(extracted.data);
     const disabledByServer = new Map();
     filteredPayload.tools = filteredPayload.tools.filter(item => {
       if (!item || typeof item.name !== 'string') return false;
@@ -1212,7 +1467,6 @@ function filterToolCallResponse(toolName, args, result, tools, discoveredNested,
       }
       return true;
     });
-
     if (disabledByServer.size > 0) {
       filteredPayload.disabled_tools = [...disabledByServer.entries()].map(([srvId, names]) => ({ [srvId]: names }));
     }
@@ -1220,164 +1474,510 @@ function filterToolCallResponse(toolName, args, result, tools, discoveredNested,
     return writeFilteredJsonToToolResult(result, extracted, filteredPayload);
   }
 
-  return result;
+  if (discoveredNested.pattern !== 'toolsets') return result;
+
+  const isListerCall = Boolean(effectiveMeta.lister && toolName === effectiveMeta.lister);
+  const isGroupInspectCall = Boolean(effectiveMeta.groupInspector && toolName === effectiveMeta.groupInspector.name);
+  const isLeafInspectCall = Boolean(effectiveMeta.leafInspector && toolName === effectiveMeta.leafInspector.name);
+  const isSearchCall = Boolean(effectiveMeta.searchTool && toolName === effectiveMeta.searchTool.name);
+
+  if (!isListerCall && !isGroupInspectCall && !isLeafInspectCall && !isSearchCall) {
+    return result;
+  }
+
+  const knownToolsetNames = new Set(
+    Array.isArray(discoveredNested.toolsets)
+      ? discoveredNested.toolsets.map(t => t && String(t.name || '').trim()).filter(Boolean)
+      : []
+  );
+
+  // Markdown / plain-text lister response filtering (e.g. Unreal list_toolsets)
+  if (!extracted && isListerCall) {
+    const content = Array.isArray(result.content) ? result.content : [];
+    const textIdx = content.findIndex(b => b && b.type === 'text' && typeof b.text === 'string' && b.text.trim());
+    if (textIdx < 0) return result;
+    const rawText = content[textIdx].text;
+    const lines = rawText.split(/\r?\n/);
+    const keptLines = [];
+    const disabledNames = [];
+    let skippingCurrent = false;
+    let matchedAny = false;
+
+    for (const line of lines) {
+      const m = line.match(/^\s{0,1}(?:[-*+]|\d+\.)\s+`?([A-Za-z0-9_.:-]+)`?(?:\s*[:\-–—]\s*(.*))?$/);
+      const candidateName = m ? m[1].trim() : '';
+      const isKnownHeader = Boolean(
+        candidateName &&
+        (knownToolsetNames.size === 0 ||
+          knownToolsetNames.has(candidateName) ||
+          disabledSet.has(joinPath([TOOLSET_ROOT_SEGMENT, candidateName])))
+      );
+      if (isKnownHeader) {
+        matchedAny = true;
+        if (isToolsetFullyDisabled(candidateName, discoveredNested, disabledSet)) {
+          skippingCurrent = true;
+          disabledNames.push(candidateName);
+        } else {
+          skippingCurrent = false;
+          keptLines.push(line);
+        }
+      } else if (!skippingCurrent) {
+        keptLines.push(line);
+      }
+    }
+
+    if (!matchedAny || disabledNames.length === 0) return result;
+    const copy = cloneJson(result);
+    const footer = formatDisabledToolsetsFooter(disabledNames, canSelfManage);
+    copy.content[textIdx] = {
+      ...copy.content[textIdx],
+      type: 'text',
+      text: keptLines.join('\n').trim() + footer
+    };
+    return copy;
+  }
+
+  if (!extracted) return result;
+
+  // Key-agnostic recursive JSON filtering across lister, groupInspector, leafInspector, and searchTool
+  const safeArgs = isPlainObject(args) ? args : {};
+  const requestedGroups = isGroupInspectCall
+    ? normalizeStringOrArray(safeArgs[effectiveMeta.groupInspector.targetParam])
+    : [];
+  const defaultGroup = requestedGroups.length === 1 ? requestedGroups[0] : '';
+  const disabledOut = [];
+
+  function pruneLeafObject(item, itemName, currentGroup) {
+    const matches = resolveLeafMatches(itemName, currentGroup, discoveredNested);
+    const leafPath = matches.length > 0
+      ? joinPath(matches[0].segments)
+      : (currentGroup
+        ? joinPath([TOOLSET_ROOT_SEGMENT, currentGroup, itemName])
+        : joinPath([TOOLSET_ROOT_SEGMENT, itemName]));
+    const pruned = pruneSchemaForDisabledActions(item, leafPath, disabledSet);
+    if (!pruned) {
+      disabledOut.push(itemName);
+      return null;
+    }
+    return pruned;
+  }
+
+  function filterNode(node, currentGroup, depth) {
+    if (depth > 16 || node === null || node === undefined) return node;
+
+    if (Array.isArray(node)) {
+      const kept = [];
+      for (const item of node) {
+        if (typeof item === 'string') {
+          const clean = item.trim();
+          if (knownToolsetNames.has(clean) && isToolsetFullyDisabled(clean, discoveredNested, disabledSet)) {
+            disabledOut.push(clean);
+            continue;
+          }
+          if (isLeafToolDisabled(clean, currentGroup, discoveredNested, disabledSet)) {
+            disabledOut.push(clean);
+            continue;
+          }
+          kept.push(item);
+        } else if (isPlainObject(item)) {
+          const itemName = String(item.name || item.tool_name || item.toolset_name || item.id || '').trim();
+          if (itemName && knownToolsetNames.has(itemName) && isToolsetFullyDisabled(itemName, discoveredNested, disabledSet)) {
+            disabledOut.push(itemName);
+            continue;
+          }
+          if (itemName && (hasStrongLeafMarkers(item) || currentGroup)) {
+            if (isLeafToolDisabled(itemName, currentGroup, discoveredNested, disabledSet)) {
+              disabledOut.push(itemName);
+              continue;
+            }
+            const pruned = pruneLeafObject(item, itemName, currentGroup);
+            if (!pruned) continue;
+            const nextGroup = (itemName && knownToolsetNames.has(itemName)) ? itemName : currentGroup;
+            kept.push(filterNode(pruned, nextGroup, depth + 1));
+            continue;
+          }
+          const nextGroup = (itemName && knownToolsetNames.has(itemName)) ? itemName : currentGroup;
+          kept.push(filterNode(item, nextGroup, depth + 1));
+        } else {
+          kept.push(item);
+        }
+      }
+      return kept;
+    }
+
+    if (isPlainObject(node)) {
+      const ownName = String(node.name || node.toolset_name || node.id || '').trim();
+      const nextGroup = (ownName && knownToolsetNames.has(ownName)) ? ownName : currentGroup;
+      const out = {};
+      for (const [k, v] of Object.entries(node)) {
+        if (SKIP_TRAVERSE_KEYS.has(k)) {
+          out[k] = v;
+          continue;
+        }
+        if (knownToolsetNames.has(k) && isToolsetFullyDisabled(k, discoveredNested, disabledSet)) {
+          disabledOut.push(k);
+          continue;
+        }
+        if (isPlainObject(v) && hasStrongLeafMarkers(v)) {
+          const leafName = String(v.name || v.tool_name || v.id || k).trim();
+          if (leafName && isLeafToolDisabled(leafName, nextGroup, discoveredNested, disabledSet)) {
+            disabledOut.push(leafName);
+            continue;
+          }
+          const pruned = pruneLeafObject(v, leafName, nextGroup);
+          if (!pruned) continue;
+          out[k] = filterNode(pruned, knownToolsetNames.has(k) ? k : nextGroup, depth + 1);
+          continue;
+        }
+        const childGroup = knownToolsetNames.has(k) ? k : nextGroup;
+        out[k] = filterNode(v, childGroup, depth + 1);
+      }
+      return out;
+    }
+
+    return node;
+  }
+
+  const filtered = filterNode(cloneJson(extracted.data), defaultGroup, 0);
+  if (disabledOut.length === 0) return result;
+
+  const uniqueDisabled = [...new Set(disabledOut)];
+  const finalPayload = isPlainObject(filtered)
+    ? { ...filtered, disabled_tools: uniqueDisabled, disabled_tools_note: disabledNote }
+    : { items: filtered, disabled_tools: uniqueDisabled, disabled_tools_note: disabledNote };
+
+  return writeFilteredJsonToToolResult(result, extracted, finalPayload);
 }
 
+// ----------------------------------------------------------------------------
+// Universal empirical nested discovery (covers all 4 MCP archetypes)
+// ----------------------------------------------------------------------------
 function isTransientDiscoveryError(text) {
-  return /timed out|etimedout|econnrefused|econnreset|ehostunreach|enetunreach|socket hang up|socket.*closed|broken pipe|upstream.*unavailable|temporarily unavailable|http\s+50[234]\b/i.test(String(text || ''));
+  return /timed out|etimedout|econnrefused|econnreset|ehostunreach|enetunreach|socket hang up|socket.*closed|broken pipe|upstream.*unavailable|temporarily unavailable|http\s+50[0234]\b|stalled|superseded|configuration changed|not initialized|session(?:\s+not\s+found|\s+expired|\s+invalid|\s+id)|aborterror|operation was aborted/i.test(String(text || ''));
+}
+
+async function callInspectorBatch(callToolFn, inspector, names, allowMarkdownFallback = false) {
+  const args = { [inspector.targetParam]: inspector.isArray ? names : names[0] };
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await callToolFn(inspector.name, args);
+      const rawText = getRawTextFromResult(res);
+      if (res && res.isError === true) {
+        if (isTransientDiscoveryError(rawText)) {
+          lastError = new Error(rawText || ('Transient error from ' + inspector.name));
+          if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+            continue;
+          }
+          return { transientError: lastError };
+        }
+        return { rejected: true, rawText };
+      }
+      const extracted = extractJsonFromToolResult(res);
+      let leaves = extractLeavesBottomUp(extracted ? extracted.data : null);
+      if (leaves.length === 0 && extracted && !inspector.isArray) {
+        leaves = extractNameOnlyLeavesFallback(extracted.data, names[0]);
+      }
+      if (leaves.length === 0 && !extracted && allowMarkdownFallback && rawText) {
+        leaves = extractLeavesFromMarkdown(rawText, !inspector.isArray ? names[0] : '');
+      }
+      return { ok: true, leaves, data: extracted ? extracted.data : null, rawText };
+    } catch (err) {
+      const msg = String(err instanceof Error ? err.message : err);
+      if (/JSON-RPC\s+-3260[12]\b/i.test(msg)) return { rejected: true, rawText: msg };
+      lastError = err;
+      if (attempt < 2) {
+        await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+        continue;
+      }
+      return { transientError: lastError };
+    }
+  }
+  return { transientError: lastError };
 }
 
 async function discoverNestedForServer(callToolFn, tools, depth = 0, maxDepth = 5) {
   if (depth >= maxDepth) return null;
-  const metaPattern = detectMetaPattern(tools);
-  if (!metaPattern) return null;
+  const pattern = detectMetaPattern(tools);
+  if (!pattern) return null;
 
-  if (metaPattern.type === 'toolsets') {
-    const listRes = await callToolFn(metaPattern.listTool, {});
-    if (listRes && listRes.isError === true) {
-      throw new Error('list_toolsets returned an error during nested tool discovery.');
+  let transientListerError = null;
+
+  // Phase 1: Try each 0-required-param lister candidate until one yields leaves or expandable groups
+  let sawAnyEmptyCandidateList = false;
+  for (const listerCand of pattern.listerCandidates) {
+    let listRes;
+    try {
+      listRes = await callToolFn(listerCand.name, {});
+    } catch (err) {
+      const msg = String(err instanceof Error ? err.message : err);
+      if (isTransientDiscoveryError(msg)) transientListerError = err;
+      continue;
     }
+    if (!listRes || listRes.isError === true) {
+      const rawErr = getRawTextFromResult(listRes);
+      if (isTransientDiscoveryError(rawErr)) {
+        transientListerError = new Error(rawErr || (listerCand.name + ' transient error'));
+      }
+      continue;
+    }
+
     const extractedList = extractJsonFromToolResult(listRes);
-    const rawText = Array.isArray(listRes && listRes.content)
-      ? listRes.content.filter(b => b && b.type === 'text').map(b => String(b.text || '')).join('\n')
-      : '';
-    const toolsets = parseToolsetsListFromData(extractedList ? extractedList.data : null, rawText);
-    if (toolsets.length === 0) {
+    const rawListText = getRawTextFromResult(listRes);
+
+    // Direct leaf catalog (e.g. nested Hotplug all_tools)
+    const directLeaves = extractLeavesBottomUp(extractedList ? extractedList.data : null);
+    if (directLeaves.length > 0) {
+      const byServer = new Map();
+      if (isPlainObject(extractedList && extractedList.data) && Array.isArray(extractedList.data.servers)) {
+        for (const srv of extractedList.data.servers) {
+          const id = String(srv.id || srv.serverId || '').trim();
+          if (id) byServer.set(id, { id, name: String(srv.name || id), tools: [], nested: null });
+        }
+      }
+      for (const leaf of directLeaves) {
+        const srvAnc = leaf.ancestors.find(a => !a.isWrapperHint);
+        const srvId = srvAnc ? String(srvAnc.id || srvAnc.name) : 'default';
+        const srvName = srvAnc ? String(srvAnc.name || srvId) : srvId;
+        if (!byServer.has(srvId)) {
+          byServer.set(srvId, { id: srvId, name: srvName, tools: [], nested: null });
+        }
+        const candidateTool = {
+          name: leaf.name,
+          description: leaf.description,
+          inputSchema: isPlainObject(leaf.inputSchema) ? leaf.inputSchema : {}
+        };
+        if (isExecutableTool(candidateTool)) {
+          byServer.get(srvId).tools.push(candidateTool);
+        }
+      }
+
+      const servers = [...byServer.values()];
+      const catalogRevision = String((extractedList && extractedList.data && extractedList.data.catalog_revision) || '');
+      for (const srv of servers) {
+        const subPattern = detectMetaPattern(srv.tools);
+        if (subPattern && depth + 1 < maxDepth) {
+          const disp = pattern.dispatcher;
+          srv.nested = await discoverNestedForServer(
+            (subToolName, subArgs) => {
+              const callArgs = { [disp.argsParam]: subArgs || {} };
+              callArgs[disp.toolParam] = encodeURIComponent(srv.id) + '::' + encodeURIComponent(subToolName);
+              for (const sp of disp.stringParams) {
+                if (sp.name !== disp.toolParam && sp.required) callArgs[sp.name] = catalogRevision;
+              }
+              return callToolFn(disp.name, callArgs);
+            },
+            srv.tools,
+            depth + 1,
+            maxDepth
+          );
+        }
+      }
+
       return {
-        pattern: 'toolsets',
-        schemaVersion: 4,
+        pattern: 'hotplug',
+        schemaVersion: DISCOVERY_SCHEMA_VERSION,
         discoveredAt: new Date().toISOString(),
-        toolsets: []
+        meta: {
+          lister: listerCand.name,
+          dispatcher: pattern.dispatcher,
+          metaTools: [listerCand.name, pattern.dispatcher.name]
+        },
+        servers
       };
     }
 
-    const descParam = metaPattern.describeParamName || 'toolset_name';
-    const detailed = [];
-    const failedToolsets = [];
-    const batchSize = 4;
-    for (let i = 0; i < toolsets.length; i += batchSize) {
-      const slice = toolsets.slice(i, i + batchSize);
-      const batchResults = await Promise.all(slice.map(async ts => {
-        let lastError = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
-          try {
-            const descRes = await callToolFn(metaPattern.describeTool, { [descParam]: ts.name });
-            const rawDescText = Array.isArray(descRes && descRes.content)
-              ? descRes.content.filter(b => b && b.type === 'text').map(b => String(b.text || '')).join('\n')
-              : '';
-            if (descRes && descRes.isError === true) {
-              // Transient transport/server overload errors are retried and abort incomplete discovery;
-              // clean application-level rejections (e.g. non-existent candidate parsed from Markdown) are skipped.
-              if (isTransientDiscoveryError(rawDescText)) {
-                lastError = new Error(rawDescText || ('describe_toolset transient error for ' + ts.name));
-                if (attempt < 2) {
-                  await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
-                  continue;
-                }
-                return { failed: ts.name, error: lastError };
-              }
-              return { skipped: true };
-            }
-            const extractedDesc = extractJsonFromToolResult(descRes);
-            const tsTools = parseToolsetToolsFromData(extractedDesc ? extractedDesc.data : null, rawDescText, ts.name)
-              .filter(isExecutableTool);
-            if (tsTools.length === 1 && tsTools[0].name === ts.name) {
-              return { item: { name: ts.name, description: tsTools[0].description || ts.description, isSingleTool: true, inputSchema: tsTools[0].inputSchema, tools: [] } };
-            }
-            if (tsTools.length === 0) return { skipped: true };
-            return { item: { name: ts.name, description: ts.description, tools: tsTools } };
-          } catch (err) {
-            const msg = String(err instanceof Error ? err.message : err);
-            if (/JSON-RPC\s+-3260[12]\b/i.test(msg)) {
-              return { skipped: true };
-            }
-            lastError = err;
-            if (attempt < 2) {
-              await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
-              continue;
-            }
-            return { failed: ts.name, error: lastError };
-          }
-        }
-        return { failed: ts.name, error: lastError };
-      }));
-      for (const entry of batchResults) {
-        if (!entry) continue;
-        if (entry.failed) failedToolsets.push(entry.failed);
-        else if (entry.item) detailed.push(entry.item);
+    // Two-step hierarchical toolsets (e.g. Unreal 5.8 / 5.9 / custom grouped MCPs)
+    const candidates = extractGroupCandidates(extractedList ? extractedList.data : null, rawListText);
+    if (candidates.length === 0) {
+      if (pattern.inspectors.length > 0) sawAnyEmptyCandidateList = true;
+      continue;
+    }
+    if (pattern.inspectors.length === 0) continue;
+
+    const candidateSet = new Set(candidates.map(c => c.name));
+    const descByGroup = new Map(candidates.map(c => [c.name, c.description]));
+    const probeSlice = candidates.slice(0, Math.min(3, candidates.length)).map(c => c.name);
+
+    let groupInspector = null;
+    let initialLeaves = [];
+    const probedNames = new Set();
+
+    for (const insp of pattern.inspectors) {
+      const namesToProbe = insp.isArray ? probeSlice : [probeSlice[0]];
+      const probeRes = await callInspectorBatch(callToolFn, insp, namesToProbe, true);
+      if (probeRes.transientError) {
+        throw probeRes.transientError;
       }
+      if (probeRes.ok && probeRes.leaves.length > 0) {
+        groupInspector = insp;
+        initialLeaves = probeRes.leaves.map(l => {
+          if (!l.ancestors.some(a => candidateSet.has(a.name)) && !insp.isArray) {
+            l.ancestors.unshift({
+              kind: 'group',
+              name: namesToProbe[0],
+              description: descByGroup.get(namesToProbe[0]) || '',
+              fromKey: false,
+              isWrapperHint: false
+            });
+          }
+          return l;
+        });
+        for (const n of namesToProbe) probedNames.add(n);
+        break;
+      }
+    }
+
+    // No inspector expanded this lister's output (e.g. distractor health_check) -> try next lister
+    if (!groupInspector) continue;
+
+    // Empirically identify optional leaf-level inspector (e.g. describe_tools)
+    let leafInspector = null;
+    const sampleLeafName = initialLeaves[0] && initialLeaves[0].name;
+    if (sampleLeafName) {
+      for (const insp of pattern.inspectors) {
+        if (insp.name === groupInspector.name) continue;
+        const probeRes = await callInspectorBatch(callToolFn, insp, [sampleLeafName], false);
+        if (probeRes.ok && probeRes.leaves.length > 0) {
+          leafInspector = insp;
+          break;
+        }
+      }
+    }
+
+    const remaining = candidates.map(c => c.name).filter(n => !probedNames.has(n));
+    const allLeaves = [...initialLeaves];
+    const failedToolsets = [];
+
+    async function processGroupChunk(chunk) {
+      const res = await callInspectorBatch(callToolFn, groupInspector, chunk, true);
+      if (res.transientError) {
+        failedToolsets.push(...chunk);
+        return;
+      }
+      if (res.rejected) {
+        if (groupInspector.isArray && chunk.length > 1) {
+          const mid = Math.ceil(chunk.length / 2);
+          await processGroupChunk(chunk.slice(0, mid));
+          await processGroupChunk(chunk.slice(mid));
+        }
+        return;
+      }
+      if (res.ok && res.leaves.length > 0) {
+        for (const l of res.leaves) {
+          if (!l.ancestors.some(a => candidateSet.has(a.name)) && chunk.length === 1) {
+            l.ancestors.unshift({
+              kind: 'group',
+              name: chunk[0],
+              description: descByGroup.get(chunk[0]) || '',
+              fromKey: false,
+              isWrapperHint: false
+            });
+          }
+          allLeaves.push(l);
+        }
+      }
+    }
+
+    const chunkSize = groupInspector.isArray ? 16 : 1;
+    const chunks = [];
+    for (let i = 0; i < remaining.length; i += chunkSize) {
+      chunks.push(remaining.slice(i, i + chunkSize));
+    }
+    const concurrency = 4;
+    for (let i = 0; i < chunks.length; i += concurrency) {
+      await Promise.all(chunks.slice(i, i + concurrency).map(processGroupChunk));
     }
 
     if (failedToolsets.length > 0) {
       throw new Error('Incomplete nested toolset discovery; failed toolsets: ' + failedToolsets.join(', '));
     }
 
+    const detailed = groupLeavesIntoToolsets(allLeaves, candidateSet, descByGroup);
+    const verifiedMetaTools = [listerCand.name, groupInspector.name, pattern.dispatcher.name];
+    if (leafInspector) verifiedMetaTools.push(leafInspector.name);
+
     return {
       pattern: 'toolsets',
-      schemaVersion: 4,
+      schemaVersion: DISCOVERY_SCHEMA_VERSION,
       discoveredAt: new Date().toISOString(),
+      meta: {
+        lister: listerCand.name,
+        dispatcher: pattern.dispatcher,
+        groupInspector,
+        leafInspector,
+        metaTools: verifiedMetaTools
+      },
       toolsets: detailed
     };
   }
 
-  if (metaPattern.type === 'hotplug') {
-    const catalogRes = await callToolFn('all_tools', {});
-    if (catalogRes && catalogRes.isError === true) {
-      throw new Error('Nested all_tools returned an error during discovery.');
-    }
-    const extracted = extractJsonFromToolResult(catalogRes);
-    const data = extracted && extracted.data;
-    if (!isPlainObject(data)) return null;
-
-    const serversMap = new Map();
-    for (const srv of Array.isArray(data.servers) ? data.servers : []) {
-      const id = String(srv.id || srv.serverId || '');
-      if (!id) continue;
-      serversMap.set(id, { id, name: String(srv.name || id), tools: [], nested: null });
-    }
-    for (const tool of Array.isArray(data.tools) ? data.tools : []) {
-      const srvId = String((tool.source && tool.source.server_id) || 'unknown');
-      const srvName = String((tool.source && tool.source.server_name) || srvId);
-      if (!serversMap.has(srvId)) {
-        serversMap.set(srvId, { id: srvId, name: srvName, tools: [], nested: null });
-      }
-      const candidateTool = {
-        name: String(tool.name || ''),
-        description: String(tool.description || ''),
-        inputSchema: isPlainObject(tool.inputSchema) ? tool.inputSchema : {}
-      };
-      if (isExecutableTool(candidateTool)) {
-        serversMap.get(srvId).tools.push(candidateTool);
-      }
-    }
-
-    const servers = [...serversMap.values()];
-    const catalogRevision = String(data.catalog_revision || '');
-    for (const srv of servers) {
-      const subPattern = detectMetaPattern(srv.tools);
-      if (subPattern && depth + 1 < maxDepth) {
-        srv.nested = await discoverNestedForServer(
-          (subToolName, subArgs) => callToolFn('call_tool', {
-            tool_id: encodeURIComponent(srv.id) + '::' + encodeURIComponent(subToolName),
-            catalog_revision: catalogRevision,
-            arguments: subArgs || {}
-          }),
-          srv.tools,
-          depth + 1,
-          maxDepth
-        );
-      }
-    }
-
-    return {
-      pattern: 'hotplug',
-      schemaVersion: 4,
-      discoveredAt: new Date().toISOString(),
-      servers
-    };
+  if (transientListerError) {
+    throw transientListerError;
   }
 
-  return null;
+  // If a hierarchical lister succeeded without throwing, but returned 0 candidates while subsystems are still warming up,
+  // retry instead of caching pattern='none' permanently.
+  if (sawAnyEmptyCandidateList) {
+    throw new Error('Hierarchical lister returned an empty candidate list; retrying discovery.');
+  }
+
+  // Phase 2: Search-based proxy (no 0-arg lister, e.g. FastMCP search_tools + call_tool)
+  for (const insp of pattern.inspectors) {
+    if (insp.isArray) continue;
+    for (const broadQuery of ['.*', '', '*']) {
+      const args = { [insp.targetParam]: broadQuery };
+      const limitOpt = insp.optionalParams.find(p => p.types.includes('integer') || p.types.includes('number'));
+      if (limitOpt) args[limitOpt.name] = 500;
+
+      let res;
+      try {
+        res = await callToolFn(insp.name, args);
+      } catch (err) {
+        const msg = String(err instanceof Error ? err.message : err);
+        if (isTransientDiscoveryError(msg)) throw err;
+        continue;
+      }
+      if (!res || res.isError === true) {
+        const rawErr = getRawTextFromResult(res);
+        if (isTransientDiscoveryError(rawErr)) throw new Error(rawErr);
+        continue;
+      }
+
+      const extracted = extractJsonFromToolResult(res);
+      const rawText = getRawTextFromResult(res);
+      let leaves = extractLeavesBottomUp(extracted ? extracted.data : null);
+      if (leaves.length === 0 && !extracted && rawText) {
+        leaves = extractLeavesFromMarkdown(rawText, '');
+      }
+      if (leaves.length > 0) {
+        const detailed = groupLeavesIntoToolsets(leaves, new Set(), new Map());
+        return {
+          pattern: 'toolsets',
+          schemaVersion: DISCOVERY_SCHEMA_VERSION,
+          discoveredAt: new Date().toISOString(),
+          meta: {
+            lister: null,
+            searchTool: insp,
+            dispatcher: pattern.dispatcher,
+            groupInspector: null,
+            leafInspector: null,
+            metaTools: [insp.name, pattern.dispatcher.name]
+          },
+          toolsets: detailed
+        };
+      }
+    }
+  }
+
+  // Confirmed not a meta-MCP server: settle cleanly as flat without infinite retries.
+  return {
+    pattern: 'none',
+    schemaVersion: DISCOVERY_SCHEMA_VERSION,
+    discoveredAt: new Date().toISOString(),
+    toolsets: []
+  };
 }
 
 function indexServerToolTree(tree) {
@@ -1802,6 +2402,7 @@ function applyServerToolMutations(tree, mutation) {
 }
 
 module.exports = {
+  DISCOVERY_SCHEMA_VERSION,
   HOTPLUG_CONTROL_SERVER_ID,
   HOTPLUG_CONTROL_MANAGE_TOOL,
   HOTPLUG_CONTROL_LIST_TOOL,

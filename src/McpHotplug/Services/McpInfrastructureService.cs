@@ -2956,9 +2956,9 @@ public sealed class McpInfrastructureService : IDisposable
                     case McpServerHealthState.Online:
                         if (string.Equals(state.Transport, "stdio", StringComparison.OrdinalIgnoreCase))
                             MarkServerPackageReady(state.ServerId);
-                        status.StatusText = I18n.Tr(
-                            "Подключён и активен",
-                            "Connected & active");
+                        status.StatusText = state.AllToolsDisabled
+                            ? I18n.Tr("Подключён и активен · 0 активных инструментов", "Connected & active · 0 active tools")
+                            : I18n.Tr("Подключён и активен", "Connected & active");
                         if (state.ResponseTimeMs.HasValue)
                             status.StatusText += " · " + state.ResponseTimeMs.Value + " ms";
                         break;
