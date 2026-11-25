@@ -1949,7 +1949,7 @@ internal sealed class TailscaleSmartRelay : IDisposable
             if (_disposed) return;
             _disposed = true;
             try { _cts?.Cancel(); } catch { }
-            try { _listener?.Stop(); } catch { }
+            try { _listener?.Server?.Close(); } catch { } try { _listener?.Stop(); } catch { }
             _listener = null;
             try { _cts?.Dispose(); } catch { }
             _cts = null;
@@ -1996,11 +1996,11 @@ internal sealed class TailscaleSmartRelay : IDisposable
         {
             if (Interlocked.Exchange(ref _aborted, 1) != 0) return;
             try { _cts.Cancel(); } catch { }
-            try { _client.Close(); } catch { }
+            try { _client.LingerState = new LingerOption(true, 0); } catch { } try { _client.Close(); } catch { }
             var up = Volatile.Read(ref _upstream);
             if (up != null)
             {
-                try { up.Close(); } catch { }
+                try { up.LingerState = new LingerOption(true, 0); } catch { } try { up.Close(); } catch { }
             }
         }
 

@@ -3,6 +3,8 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -134,6 +136,7 @@ internal static class Program
             if (!WaitForParentExit(parentPid, ParentExitTimeoutMilliseconds))
                 throw new TimeoutException("MCP Hotplug did not finish its shutdown; installation was not started.");
 
+            WaitForHotplugPortsFree(6000);
             if (!File.Exists(installerPath))
                 throw new FileNotFoundException("The downloaded update installer no longer exists.", installerPath);
 
@@ -161,6 +164,7 @@ internal static class Program
             // The installer has exited successfully. It is now safe to remove
             // the downloaded payload from the temporary Publish directory.
             TryDeleteFile(installerPath);
+            WaitForHotplugPortsFree(6000);
             LaunchHotplug(targetHotplugPath, workerPath, true);
             return 0;
         }
@@ -171,6 +175,37 @@ internal static class Program
             // Keep the verified installer so the next attempt can reuse it.
             LaunchHotplug(sourceHotplugPath, workerPath, false);
             return 1;
+        }
+    }
+
+    private static void WaitForHotplugPortsFree(int timeoutMs)
+    {
+        var ports = new[] { 18006, 8001, 8003, 8004, 8005 };
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            var allFree = true;
+            foreach (var port in ports)
+            {
+                TcpListener? probe = null;
+                try
+                {
+                    probe = new TcpListener(IPAddress.Loopback, port);
+                    probe.Server.ExclusiveAddressUse = true;
+                    probe.Start();
+                }
+                catch
+                {
+                    allFree = false;
+                }
+                finally
+                {
+                    try { probe?.Stop(); } catch { }
+                }
+                if (!allFree) break;
+            }
+            if (allFree) return;
+            Thread.Sleep(150);
         }
     }
 

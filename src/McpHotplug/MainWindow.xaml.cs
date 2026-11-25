@@ -2244,6 +2244,57 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task StopAndVerifyAllBeforeUpdateAsync()
+    {
+        if (_cleanupCompleted) return;
+        _cleanupStarted = true;
+        _mcpInfrastructure.StatusChanged -= McpInfrastructure_StatusChanged;
+
+        try
+        {
+            var stopTailscale = Task.Run(async () =>
+            {
+                try { await _tailscaleManager.ShutdownAsync().ConfigureAwait(false); }
+                catch (Exception ex) { ErrorLog.Write("MainWindow.UpdateStopTailscale", ex); }
+            });
+            var stopMcp = Task.Run(async () =>
+            {
+                try { await _mcpInfrastructure.StopAsync().ConfigureAwait(false); }
+                catch (Exception ex) { ErrorLog.Write("MainWindow.UpdateStopMcp", ex); }
+            });
+
+            await Task.WhenAny(Task.WhenAll(stopTailscale, stopMcp), Task.Delay(TimeSpan.FromSeconds(15)));
+        }
+        finally
+        {
+            try { _tailscaleManager.Dispose(); } catch { }
+        }
+
+        var corePorts = new[] { 18006, 8001, 8003, 8004, 8005 };
+        var deadline = DateTime.UtcNow.AddSeconds(6);
+        while (DateTime.UtcNow < deadline)
+        {
+            StaleManagedProcessCleaner.CleanupKnownOrphans();
+            var allFree = true;
+            foreach (var port in corePorts)
+            {
+                if (!TcpPortInspector.TryBindLoopback(port, out _))
+                {
+                    allFree = false;
+                    break;
+                }
+            }
+            if (allFree) break;
+            await Task.Delay(150);
+        }
+
+        _cleanupCompleted = true;
+        try { _logsRefreshTimer?.Stop(); } catch { }
+        try { _logsWatcher?.Dispose(); } catch { }
+        _logsWatcher = null;
+        _trayIcon.Visible = false;
+    }
+
     private void SetUpdateStatus(string message)
     {
         UpdateStatusText.Text = message;
