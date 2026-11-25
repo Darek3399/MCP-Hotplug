@@ -145,6 +145,7 @@ Source: "..\Dependencies\tailscale-setup.msi"; DestDir: "{app}\Dependencies"; Fl
 Source: "..\scripts\Uninstall-Tailscale.ps1"; DestDir: "{app}\Scripts"; Flags: ignoreversion
 Source: "..\scripts\TailscaleSetup.ps1"; DestDir: "{app}\Scripts"; Flags: ignoreversion
 Source: "..\scripts\Cleanup-Updates.ps1"; DestDir: "{app}\Scripts"; Flags: ignoreversion
+Source: "..\scripts\Stop-McpHotplugRuntime.ps1"; DestDir: "{app}\Scripts"; Flags: ignoreversion
 Source: "..\Dependencies\node-v26.13.0-x64.msi"; Flags: dontcopy
 #ifdef FilesystemMcpPayload
 Source: "..\Dependencies\FilesystemMcp-engine.json"; Flags: dontcopy
@@ -165,6 +166,7 @@ Name: "{group}\MCP Hotplug"; Filename: "{app}\{#AppExeName}"; IconFilename: "{ap
 Name: "{autodesktop}\MCP Hotplug"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\Resources\MCPHotplug.ico"; Tasks: desktopicon
 
 [UninstallRun]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\Scripts\Stop-McpHotplugRuntime.ps1"" -AppDirectory ""{app}"" -Mode Uninstall"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StoppingApp}"; RunOnceId: "StopMCPHotplugRuntime"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM MCPHotplug.exe"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StoppingApp}"; RunOnceId: "StopMCPHotplug"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\Scripts\Uninstall-Tailscale.ps1"" -MsiPath ""{app}\Dependencies\tailscale-installed.msi"" -StateFile ""{app}\Config\tailscale-state.txt"""; Flags: runhidden waituntilterminated; RunOnceId: "StopAndUninstallTailscale"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\Scripts\Cleanup-Updates.ps1"" -UpdatesDirectory ""{app}\Updates"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanupMCPHotplugUpdates"
@@ -468,6 +470,31 @@ begin
   SetInstallStatus(CustomMessage('StatusCopyingFiles'));
 end;
 
+procedure StopRunningMcpHotplugForInstall;
+var
+  PowerShellPath: String;
+  ScriptPath: String;
+  Parameters: String;
+  ExitCode: Integer;
+begin
+  SetInstallStatus(CustomMessage('StoppingApp'));
+  if not FileExists(ExpandConstant('{tmp}\Stop-McpHotplugRuntime.ps1')) then
+    ExtractTemporaryFile('Stop-McpHotplugRuntime.ps1');
+
+  ScriptPath := ExpandConstant('{tmp}\Stop-McpHotplugRuntime.ps1');
+  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ScriptPath +
+    '" -AppDirectory "' + ExpandConstant('{app}') + '" -Mode Install';
+  if PreviousInstallDir <> '' then
+    Parameters := Parameters + ' -PreviousInstallDir "' + PreviousInstallDir + '"';
+
+  if not Exec(PowerShellPath, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+  begin
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM MCPHotplug.exe', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM MCPBridge.exe', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ExitCode: Integer;
@@ -491,7 +518,7 @@ begin
     Exit;
   end;
 
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM MCPHotplug.exe', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+  StopRunningMcpHotplugForInstall;
   if OldUninstallString <> '' then
   begin
     RegWriteStringValue(HKLM, 'Software\MCPHotplug', 'UpgradeInProgress', '1');

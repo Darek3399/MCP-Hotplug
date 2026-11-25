@@ -267,6 +267,7 @@ public sealed class McpServerStatusSnapshot : INotifyPropertyChanged
     public int ToolsCount { get; set; }
     public int TotalToolsCount { get; set; }
     public bool AllToolsDisabled { get; set; }
+    public bool NoAllowedDirectories { get; set; }
     public string ToolsPreview { get; set; } = string.Empty;
     public string LastDiagnosticLog { get; set; } = string.Empty;
 
@@ -287,6 +288,7 @@ public sealed class McpServerStatusSnapshot : INotifyPropertyChanged
         ToolsCount = source.ToolsCount;
         TotalToolsCount = source.TotalToolsCount;
         AllToolsDisabled = source.AllToolsDisabled;
+        NoAllowedDirectories = source.NoAllowedDirectories;
         ToolsPreview = source.ToolsPreview;
         LastDiagnosticLog = source.LastDiagnosticLog;
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(string.Empty));
@@ -335,6 +337,11 @@ public sealed class McpServerStatusSnapshot : INotifyPropertyChanged
         McpServerHealthState.Quarantine => "#FF6B78",
         _ => "#7F8790"
     };
+
+    public string StatusTextForeground =>
+        HealthState == McpServerHealthState.Online && (AllToolsDisabled || NoAllowedDirectories)
+            ? "#F5A623"
+            : BadgeForeground;
 
     public System.Windows.Visibility CustomActionsVisibility => System.Windows.Visibility.Visible;
 

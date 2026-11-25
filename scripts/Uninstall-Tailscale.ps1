@@ -126,6 +126,7 @@ $stateText = (Get-Content -LiteralPath $StateFile) -join [Environment]::NewLine
 $installedByBridge = $stateText -match '(?m)^InstalledByMcp(?:Hotplug|Bridge)=1$'
 $bridgeAppliedSettings = $stateText -match '(?m)^TailscaleSettingsApplied=1$' -or
     $stateText -match '(?m)^(?:Hotplug|Bridge)SetupComplete=1$'
+$bridgeModifiedProxy = $stateText -match '(?m)^PreviousServiceEnvironmentSaved=1$'
 
 # During an in-place upgrade, preserve an unconfigured pre-existing Tailscale
 # session. Stop the service only if Bridge had already taken ownership of it.
@@ -144,7 +145,7 @@ if ($upgradeInProgress) {
     exit 0
 }
 
-if ($installedByBridge -or $bridgeAppliedSettings) {
+if ($installedByBridge -or $bridgeAppliedSettings -or $bridgeModifiedProxy) {
     $sessionId = (Get-Process -Id $PID).SessionId
     Get-Process -Name 'tailscale-ipn' -ErrorAction SilentlyContinue |
         Where-Object { $_.SessionId -eq $sessionId } |

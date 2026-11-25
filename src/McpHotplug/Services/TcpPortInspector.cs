@@ -16,6 +16,18 @@ internal static class TcpPortInspector
     private const uint TcpStateListen = 2;
     private const int ErrorInsufficientBuffer = 122;
     private const int ErrorNoData = 232;
+    private const uint HandleFlagInherit = 0x00000001;
+
+    /// <summary>
+    /// Clears HANDLE_FLAG_INHERIT on a native socket or kernel handle so child
+    /// processes spawned via CreateProcess(bInheritHandles=true) in .NET Framework 4.8
+    /// cannot inherit and keep listening sockets alive after this process exits.
+    /// </summary>
+    public static void DisableHandleInheritance(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return;
+        try { SetHandleInformation(handle, HandleFlagInherit, 0); } catch { }
+    }
 
     public static bool IsPortActivelyListening(int port, string? portFile = null)
     {
@@ -200,6 +212,7 @@ internal static class TcpPortInspector
         try
         {
             listener = new TcpListener(IPAddress.Loopback, port);
+            DisableHandleInheritance(listener.Server.Handle);
             listener.Server.ExclusiveAddressUse = true;
             listener.Start();
             message = "Порт свободен.";
@@ -289,4 +302,11 @@ internal static class TcpPortInspector
         int ipVersion,
         int tableClass,
         uint reserved);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetHandleInformation(
+        IntPtr hObject,
+        uint dwMask,
+        uint dwFlags);
 }

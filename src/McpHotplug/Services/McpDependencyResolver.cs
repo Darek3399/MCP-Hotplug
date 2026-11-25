@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.Win32;
 using System.Text.RegularExpressions;
 
@@ -122,6 +124,7 @@ public static class McpDependencyResolver
     public static readonly Version MinimumTailscaleVersion = new(1, 52, 0);
 
     private static readonly object ReportSync = new();
+    private static readonly ConcurrentDictionary<string, Version> ExecutableVersionCache = new(StringComparer.OrdinalIgnoreCase);
     private static McpDependencyReport? _cachedReport;
     private static DateTime _cachedReportAtUtc = DateTime.MinValue;
     private static readonly TimeSpan ReportCacheLifetime = TimeSpan.FromMinutes(5);
@@ -136,6 +139,7 @@ public static class McpDependencyResolver
 
     public static void InvalidateCache()
     {
+        ExecutableVersionCache.Clear();
         lock (ReportSync)
         {
             _cachedReport = null;
@@ -143,18 +147,63 @@ public static class McpDependencyResolver
         }
     }
 
+    private static bool AreResolvedPathsStillPresent(McpDependencyReport report)
+    {
+        foreach (var item in report.Items)
+        {
+            if (item.IsAvailable && !string.IsNullOrWhiteSpace(item.Path) && !File.Exists(item.Path))
+                return false;
+        }
+        return true;
+    }
+
     public static McpDependencyReport CheckDependencies(bool forceRefresh = false)
     {
+        if (forceRefresh)
+            ExecutableVersionCache.Clear();
+
         lock (ReportSync)
         {
             if (!forceRefresh && _cachedReport != null &&
-                DateTime.UtcNow - _cachedReportAtUtc < ReportCacheLifetime)
+                _cachedReport.CoreReady && _cachedReport.FilesystemReady &&
+                DateTime.UtcNow - _cachedReportAtUtc < ReportCacheLifetime &&
+                AreResolvedPathsStillPresent(_cachedReport))
                 return _cachedReport;
         }
 
         var items = new List<McpDependencyStatus>();
 
-        var nodeRuntime = FindInstalledNodeRuntime();
+        var supergatewayPath = FindFirstExisting(new[]
+        {
+            Path.Combine(AppPaths.DependenciesDirectory, "supergateway.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Supergateway", "supergateway.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Supergateway", "supergateway.exe"),
+            FindOnPath("supergateway.exe")
+        });
+        var uvPath = FindFirstExisting(new[]
+        {
+            Path.Combine(AppPaths.DependenciesDirectory, "uv.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "uv", "uv.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "uv.exe"),
+            FindOnPath("uv.exe")
+        });
+        var uvxPath = FindFirstExisting(new[]
+        {
+            Path.Combine(AppPaths.DependenciesDirectory, "uvx.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "uv", "uvx.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "uvx.exe"),
+            FindOnPath("uvx.exe")
+        });
+        var tailscalePath = FindTailscaleExecutable();
+
+        var nodeTask = Task.Run(FindInstalledNodeRuntime);
+        var supergatewayTask = Task.Run(() => ReadExecutableVersion(supergatewayPath, "--version"));
+        var uvTask = Task.Run(() => ReadExecutableVersion(uvPath, "--version"));
+        var uvxTask = Task.Run(() => ReadExecutableVersion(uvxPath, "--version"));
+        var tailscaleTask = Task.Run(() => ReadExecutableVersion(tailscalePath, "version"));
+        Task.WaitAll(nodeTask, supergatewayTask, uvTask, uvxTask, tailscaleTask);
+
+        var nodeRuntime = nodeTask.Result;
         var nodeAvailable = !string.IsNullOrWhiteSpace(nodeRuntime.Path) &&
             nodeRuntime.Version >= MinimumNodeVersion;
         items.Add(CreateStatus(
@@ -205,14 +254,7 @@ public static class McpDependencyResolver
                                 "This package requires Node.js " + filesystemMinimumNodeVersion + " or newer; the current Hotplug runtime is " + nodeRuntime.Version + ".")
                             : I18n.Tr("Пакет Filesystem MCP доступен.", "Filesystem MCP package is available.")));
 
-        var supergatewayPath = FindFirstExisting(new[]
-        {
-            Path.Combine(AppPaths.DependenciesDirectory, "supergateway.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Supergateway", "supergateway.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Supergateway", "supergateway.exe"),
-            FindOnPath("supergateway.exe")
-        });
-        var supergatewayVersion = ReadExecutableVersion(supergatewayPath, "--version");
+        var supergatewayVersion = supergatewayTask.Result;
         var supergatewayAvailable = !string.IsNullOrWhiteSpace(supergatewayPath) &&
             supergatewayVersion != null && supergatewayVersion >= MinimumSupergatewayVersion;
         items.Add(CreateStatus(
@@ -232,14 +274,7 @@ public static class McpDependencyResolver
                         ? I18n.Tr("Текущая версия не поддерживает используемый Hotplug формат --config.", "The installed version does not support the --config format used by Hotplug.")
                         : I18n.Tr("Совместимая версия Supergateway доступна.", "A compatible Supergateway version is available.")));
 
-        var uvPath = FindFirstExisting(new[]
-        {
-            Path.Combine(AppPaths.DependenciesDirectory, "uv.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "uv", "uv.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "uv.exe"),
-            FindOnPath("uv.exe")
-        });
-        var uvVersion = ReadExecutableVersion(uvPath, "--version");
+        var uvVersion = uvTask.Result;
         var uvAvailable = !string.IsNullOrWhiteSpace(uvPath) && uvVersion != null && uvVersion >= MinimumUvVersion;
         items.Add(CreateStatus(
             "uv",
@@ -256,14 +291,7 @@ public static class McpDependencyResolver
                     ? I18n.Tr("Не удалось подтвердить совместимую версию uv.", "A compatible uv version could not be confirmed.")
                     : I18n.Tr("uv доступен.", "uv is available.")));
 
-        var uvxPath = FindFirstExisting(new[]
-        {
-            Path.Combine(AppPaths.DependenciesDirectory, "uvx.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "uv", "uvx.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "uvx.exe"),
-            FindOnPath("uvx.exe")
-        });
-        var uvxVersion = ReadExecutableVersion(uvxPath, "--version");
+        var uvxVersion = uvxTask.Result;
         var uvxAvailable = !string.IsNullOrWhiteSpace(uvxPath) && uvxVersion != null && uvxVersion >= MinimumUvVersion;
         items.Add(CreateStatus(
             "uvx",
@@ -280,8 +308,7 @@ public static class McpDependencyResolver
                     ? I18n.Tr("Не удалось подтвердить совместимую версию uvx.", "A compatible uvx version could not be confirmed.")
                     : I18n.Tr("uvx доступен.", "uvx is available.")));
 
-        var tailscalePath = FindTailscaleExecutable();
-        var tailscaleVersion = ReadExecutableVersion(tailscalePath, "version");
+        var tailscaleVersion = tailscaleTask.Result;
         var tailscaleAvailable = !string.IsNullOrWhiteSpace(tailscalePath) &&
             tailscaleVersion != null && tailscaleVersion >= MinimumTailscaleVersion;
         items.Add(CreateStatus(
@@ -416,9 +443,27 @@ public static class McpDependencyResolver
         }
     }
 
+    private static string? BuildExecutableCacheKey(string executablePath, string arguments)
+    {
+        try
+        {
+            var info = new FileInfo(executablePath);
+            if (!info.Exists) return null;
+            return info.FullName + "|" + arguments + "|" + info.Length + "|" + info.LastWriteTimeUtc.Ticks;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static Version? ReadExecutableVersion(string? executablePath, string arguments)
     {
         if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath)) return null;
+        var cacheKey = BuildExecutableCacheKey(executablePath!, arguments);
+        if (cacheKey != null && ExecutableVersionCache.TryGetValue(cacheKey, out var cachedVersion))
+            return cachedVersion;
+
         try
         {
             using var process = new Process
@@ -434,16 +479,26 @@ public static class McpDependencyResolver
                 }
             };
             if (!process.Start()) return null;
-            if (!process.WaitForExit(1800))
+            // Drain both streams concurrently to prevent pipe buffer deadlocks and
+            // avoid aborting slow cold-start binaries (e.g., 99 MB supergateway.exe under AV scan).
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(15000))
             {
                 try { process.Kill(); } catch { }
                 return null;
             }
-            var output = process.StandardOutput.ReadToEnd() + " " + process.StandardError.ReadToEnd();
+            Task.WaitAll(new Task[] { stdoutTask, stderrTask }, 2000);
+            var stdout = stdoutTask.IsCompleted ? stdoutTask.Result : string.Empty;
+            var stderr = stderrTask.IsCompleted ? stderrTask.Result : string.Empty;
+            var output = stdout + " " + stderr;
             var match = Regex.Match(output, @"(?<!\d)v?(?<version>\d+\.\d+(?:\.\d+)?)(?!\d)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-            return match.Success && Version.TryParse(NormalizeVersion(match.Groups["version"].Value), out var version)
-                ? version
-                : null;
+            if (match.Success && Version.TryParse(NormalizeVersion(match.Groups["version"].Value), out var version))
+            {
+                if (cacheKey != null) ExecutableVersionCache[cacheKey] = version;
+                return version;
+            }
+            return null;
         }
         catch { return null; }
     }
@@ -678,6 +733,10 @@ public static class McpDependencyResolver
 
     private static Version ReadNodeVersion(string nodeExecutable)
     {
+        var cacheKey = BuildExecutableCacheKey(nodeExecutable, "--version");
+        if (cacheKey != null && ExecutableVersionCache.TryGetValue(cacheKey, out var cachedVersion))
+            return cachedVersion;
+
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo
@@ -692,18 +751,22 @@ public static class McpDependencyResolver
         };
 
         if (!process.Start()) throw new InvalidOperationException("Не удалось запустить Node.js для проверки версии.");
-        if (!process.WaitForExit(5000))
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(10000))
         {
             try { process.Kill(); } catch { }
-            throw new TimeoutException("Проверка версии Node.js превысила 5 секунд.");
+            throw new TimeoutException("Проверка версии Node.js превысила 10 секунд.");
         }
 
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
+        Task.WaitAll(new Task[] { stdoutTask, stderrTask }, 2000);
+        var output = stdoutTask.IsCompleted ? stdoutTask.Result : string.Empty;
+        var error = stderrTask.IsCompleted ? stderrTask.Result : string.Empty;
         var match = Regex.Match(output + " " + error, @"v(?<version>\d+(?:\.\d+){1,2})", RegexOptions.CultureInvariant);
         if (!match.Success || !Version.TryParse(NormalizeVersion(match.Groups["version"].Value), out var version))
             throw new InvalidOperationException("Не удалось определить версию Node.js. Вывод: " + (output + " " + error).Trim());
 
+        if (cacheKey != null) ExecutableVersionCache[cacheKey] = version;
         return version;
     }
 

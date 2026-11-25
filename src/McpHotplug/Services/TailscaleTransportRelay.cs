@@ -7,6 +7,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -924,10 +925,29 @@ internal static class TailscaleNetworkProbe
         }
     }
 
+    private const uint HandleFlagInherit = 0x00000001;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetHandleInformation(IntPtr hObject, uint dwMask, uint dwFlags);
+
+    internal static void DisableSocketHandleInheritance(Socket? socket)
+    {
+        if (socket == null) return;
+        try
+        {
+            var handle = socket.Handle;
+            if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+                SetHandleInformation(handle, HandleFlagInherit, 0);
+        }
+        catch { }
+    }
+
     internal static void EnableTcpKeepAlive(TcpClient client)
     {
         try
         {
+            DisableSocketHandleInheritance(client.Client);
             var vals = new byte[12];
             BitConverter.GetBytes(1u).CopyTo(vals, 0);
             BitConverter.GetBytes(20000u).CopyTo(vals, 4);
@@ -1400,19 +1420,59 @@ internal sealed class TailscaleSmartRelay : IDisposable
         get { lock (_sync) return _listener != null; }
     }
 
-    public void EnsureStarted()
+    public void EnsureStarted(int retryTimeoutMs = 1500)
     {
         TailscaleRoute routeSnapshot;
         lock (_sync)
         {
             if (_disposed || _listener != null) return;
-            var listener = new TcpListener(IPAddress.Loopback, RelayPort);
-            listener.Start();
-            _listener = listener;
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(Math.Max(0, retryTimeoutMs));
+            SocketException? lastAddressInUse = null;
+            TcpListener? startedListener = null;
+
+            while (true)
+            {
+                TcpListener? candidate = null;
+                try
+                {
+                    candidate = new TcpListener(IPAddress.Loopback, RelayPort);
+                    candidate.Server.ExclusiveAddressUse = true;
+                    TailscaleNetworkProbe.DisableSocketHandleInheritance(candidate.Server);
+                    candidate.Start();
+                    startedListener = candidate;
+                    break;
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+                {
+                    try { candidate?.Stop(); } catch { }
+                    lastAddressInUse = ex;
+                    if (DateTime.UtcNow >= deadline || _disposed)
+                        break;
+                    Thread.Sleep(150);
+                }
+                catch
+                {
+                    try { candidate?.Stop(); } catch { }
+                    throw;
+                }
+            }
+
+            if (startedListener == null)
+            {
+                var ownerInfo = TcpPortInspector.DescribeListeners(RelayPort);
+                throw new InvalidOperationException(
+                    I18n.Tr(
+                        $"Локальный сокет релея Tailscale (127.0.0.1:{RelayPort}) уже занят.{ownerInfo}",
+                        $"Tailscale local relay socket (127.0.0.1:{RelayPort}) is already in use.{ownerInfo}"),
+                    lastAddressInUse);
+            }
+
+            _listener = startedListener;
             _cts = new CancellationTokenSource();
             routeSnapshot = _currentRoute;
             var token = _cts.Token;
-            _ = Task.Run(() => AcceptLoopAsync(listener, token));
+            _ = Task.Run(() => AcceptLoopAsync(startedListener, token));
         }
         if (ErrorLog.Enabled)
             ErrorLog.LogConnection($"[Tailscale][Relay] Listening on 127.0.0.1:{RelayPort} (route={routeSnapshot})");
@@ -1548,7 +1608,7 @@ internal sealed class TailscaleSmartRelay : IDisposable
                     tunnel.AttachUpstream(upstream);
                     Interlocked.Exchange(ref _consecutiveConnectFailures, 0);
                 }
-                catch (OperationCanceledException) when (tunnel.IsAborted || shutdownToken.IsCancellationRequested)
+                catch (Exception) when (tunnel.IsAborted || shutdownToken.IsCancellationRequested)
                 {
                     return;
                 }
@@ -1638,7 +1698,7 @@ internal sealed class TailscaleSmartRelay : IDisposable
                     tunnel.AttachUpstream(upstream);
                     Interlocked.Exchange(ref _consecutiveConnectFailures, 0);
                 }
-                catch (OperationCanceledException) when (tunnel.IsAborted || shutdownToken.IsCancellationRequested)
+                catch (Exception) when (tunnel.IsAborted || shutdownToken.IsCancellationRequested)
                 {
                     return;
                 }

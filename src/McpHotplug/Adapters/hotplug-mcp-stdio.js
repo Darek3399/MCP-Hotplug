@@ -16,6 +16,12 @@ const TOOLS = [
     name: 'all_tools',
     title: 'Get the live Hotplug tool catalog',
     description: toolPolicy.GATEWAY_ALL_TOOLS_DESCRIPTION,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
       properties: {},
@@ -31,6 +37,12 @@ const TOOLS = [
       'Arguments are validated against the selected server’s latest cached inputSchema. MCP Hotplug resolves ' +
       'the current server route and protects dispatch against concurrent cache changes internally. ' +
       'Do not automatically repeat operations that may have side effects after an upstream failure.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false
+    },
     inputSchema: {
       type: 'object',
       properties: {

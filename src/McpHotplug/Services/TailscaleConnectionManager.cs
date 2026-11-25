@@ -82,7 +82,7 @@ public sealed class TailscaleConnectionManager : IDisposable
         {
             try
             {
-                _relay.EnsureStarted();
+                _relay.EnsureStarted(retryTimeoutMs: 450);
                 if (!_settings.TailscaleFunnelEnabled)
                     _ = PrewarmRelayRouteAsync(_lifetimeCancellation.Token);
             }
@@ -386,7 +386,7 @@ public sealed class TailscaleConnectionManager : IDisposable
         {
             var relayReady = TailscaleService.IsServiceProxyConfiguredForRelay();
             var mlkemReady = !cachedRoute.IsDpiSafeDirect || TailscaleService.IsServiceMlkemDisabled();
-            if ((relayReady || cachedRoute.Kind == TailscaleRouteKind.Direct) && mlkemReady)
+            if (((relayReady && _relay.IsRunning) || (!relayReady && cachedRoute.Kind == TailscaleRouteKind.Direct)) && mlkemReady)
             {
                 return new TailscaleRouteProbeResult
                 {
@@ -423,7 +423,7 @@ public sealed class TailscaleConnectionManager : IDisposable
 
         if (serviceUsesRelay || winner.Kind != TailscaleRouteKind.Direct)
         {
-            _relay.EnsureStarted();
+            _relay.EnsureStarted(retryTimeoutMs: 2000);
             _relay.SetRoute(winner, abortExistingTunnels: !winner.Equals(previousRoute));
         }
 

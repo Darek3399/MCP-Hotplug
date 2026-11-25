@@ -1,9 +1,11 @@
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -66,7 +68,7 @@ internal static class Program
         {
             File.Copy(Assembly.GetExecutingAssembly().Location, workerPath, false);
 
-            var workerArguments = JoinArguments(new[]
+            var workerArguments = new[]
             {
                 "--worker",
                 installerPath,
@@ -76,20 +78,9 @@ internal static class Program
                 language,
                 expectedSha256,
                 workerPath
-            });
+            };
 
-            var process = Process.Start(new ProcessStartInfo
-            {
-                FileName = workerPath,
-                Arguments = workerArguments,
-                WorkingDirectory = updatesDirectory,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            });
-
-            if (process == null)
-                throw new InvalidOperationException("Windows did not start the background updater worker.");
+            StartDetachedProcess(workerPath, workerArguments, updatesDirectory, hideWindow: true);
 
             return 0;
         }
@@ -214,23 +205,124 @@ internal static class Program
             return;
         }
 
-        var arguments = JoinArguments(new[]
+        var arguments = new[]
         {
             "--update-handoff",
             Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture),
             workerPath,
             removeInstallers ? "1" : "0",
             "--skip-update-check"
-        });
+        };
 
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = hotplugPath,
-            Arguments = arguments,
-            WorkingDirectory = Path.GetDirectoryName(hotplugPath) ?? Environment.CurrentDirectory,
-            UseShellExecute = false
-        });
+        StartDetachedProcess(
+            hotplugPath,
+            arguments,
+            Path.GetDirectoryName(hotplugPath) ?? Environment.CurrentDirectory,
+            hideWindow: false);
     }
+
+    private const uint CreateNoWindowFlag = 0x08000000;
+    private const int StartfUseShowWindowFlag = 0x00000001;
+    private const short SwHideFlag = 0;
+
+    private static void StartDetachedProcess(
+        string executablePath,
+        string[] arguments,
+        string? workingDirectory,
+        bool hideWindow)
+    {
+        var commandLine = new StringBuilder();
+        commandLine.Append(QuoteArgument(executablePath));
+        foreach (var argument in arguments)
+        {
+            commandLine.Append(' ');
+            commandLine.Append(QuoteArgument(argument));
+        }
+
+        var startupInfo = new StartupInfo
+        {
+            cb = Marshal.SizeOf(typeof(StartupInfo))
+        };
+        if (hideWindow)
+        {
+            startupInfo.dwFlags = StartfUseShowWindowFlag;
+            startupInfo.wShowWindow = SwHideFlag;
+        }
+
+        var creationFlags = hideWindow ? CreateNoWindowFlag : 0u;
+        var currentDirectory = string.IsNullOrWhiteSpace(workingDirectory) ? null : workingDirectory;
+
+        if (!CreateProcess(
+                executablePath,
+                commandLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                creationFlags,
+                IntPtr.Zero,
+                currentDirectory,
+                ref startupInfo,
+                out var processInfo))
+        {
+            var error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error, "CreateProcess failed for " + executablePath + " (Win32=" + error + ").");
+        }
+
+        if (processInfo.hThread != IntPtr.Zero)
+            CloseHandle(processInfo.hThread);
+        if (processInfo.hProcess != IntPtr.Zero)
+            CloseHandle(processInfo.hProcess);
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct StartupInfo
+    {
+        public int cb;
+        public string? lpReserved;
+        public string? lpDesktop;
+        public string? lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessInformation
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateProcess(
+        string? lpApplicationName,
+        StringBuilder lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string? lpCurrentDirectory,
+        ref StartupInfo lpStartupInfo,
+        out ProcessInformation lpProcessInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr hObject);
 
     private static string NormalizeLanguage(string value) =>
         string.Equals(value, "en", StringComparison.OrdinalIgnoreCase) ||
@@ -247,9 +339,6 @@ internal static class Program
         using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, FileOptions.SequentialScan))
             return BitConverter.ToString(sha256.ComputeHash(stream)).Replace("-", string.Empty);
     }
-
-    private static string JoinArguments(string[] values) =>
-        string.Join(" ", values.Select(QuoteArgument));
 
     // Windows command-line quoting that also handles trailing backslashes.
     private static string QuoteArgument(string value)

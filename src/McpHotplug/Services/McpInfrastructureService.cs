@@ -860,15 +860,27 @@ public sealed class McpInfrastructureService : IDisposable
             if (!IsHotplugGatewayReady && DateTime.UtcNow >= _nextHotplugGatewayRetryUtc)
                 await EnsureHotplugMcpGatewayAsync(dependencies).ConfigureAwait(false);
 
-            if (_filesystemEnabled && _filesystemGateway != null && IsExited(_filesystemGateway.Process))
+            if (_filesystemEnabled && (_filesystemGateway == null || IsExited(_filesystemGateway.Process)))
             {
-                await ReconcileFilesystemServerAsync(dependencies, _activeRoots, true).ConfigureAwait(false);
-                changed = true;
+                var fsExited = _filesystemGateway != null && IsExited(_filesystemGateway.Process);
+                var fsStatus = _statusById.TryGetValue(SettingsStore.BuiltInFilesystemId, out var existingFs) ? existingFs : null;
+                var fsQuarantined = fsStatus != null && fsStatus.HealthState == McpServerHealthState.Quarantine;
+                if (fsExited || !fsQuarantined || (fsStatus!.MissingDependency && dependencies.HasFilesystemFeature))
+                {
+                    await ReconcileFilesystemServerAsync(dependencies, _desiredRoots, true).ConfigureAwait(false);
+                    changed = true;
+                }
             }
             if (_binaryEnabled && (_binaryMcp == null || IsExited(_binaryMcp.Process)))
             {
-                await ReconcileBinaryServerAsync(dependencies, _desiredRoots, true).ConfigureAwait(false);
-                changed = true;
+                var binExited = _binaryMcp != null && IsExited(_binaryMcp.Process);
+                var binStatus = _statusById.TryGetValue(SettingsStore.BuiltInBinaryId, out var existingBin) ? existingBin : null;
+                var binQuarantined = binStatus != null && binStatus.HealthState == McpServerHealthState.Quarantine;
+                if (binExited || !binQuarantined || (binStatus!.MissingDependency && dependencies.HasNode))
+                {
+                    await ReconcileBinaryServerAsync(dependencies, _desiredRoots, true).ConfigureAwait(false);
+                    changed = true;
+                }
             }
 
             foreach (var custom in _customServers.Where(server =>
@@ -1127,6 +1139,7 @@ public sealed class McpInfrastructureService : IDisposable
 
             await ReconcileFilesystemServerAsync(dependencies, roots, true).ConfigureAwait(false);
             await ReconcileBinaryServerAsync(dependencies, roots, false).ConfigureAwait(false);
+            RefreshOnlineRootsScopedStatuses();
             ErrorLog.LogConnection(I18n.Tr("Обновлены разрешённые папки MCP: активных " + roots.Length + ".", "Updated MCP allowed folders: " + roots.Length + " active."));
 
             if (routerNeedsStart && !dependencies.HasNode)
@@ -1809,6 +1822,7 @@ public sealed class McpInfrastructureService : IDisposable
 
             _activeRoots = Array.Empty<string>();
             _activeFilesystemFingerprint = string.Empty;
+            status.MissingDependency = true;
             status.HealthState = McpServerHealthState.Quarantine;
             status.ToolsCount = 0;
             status.ToolsPreview = string.Empty;
@@ -1817,6 +1831,8 @@ public sealed class McpInfrastructureService : IDisposable
             _filesystemStatus = status.StatusText;
             return;
         }
+
+        status.MissingDependency = false;
 
         var alive = _filesystemGateway != null && !IsExited(_filesystemGateway.Process);
         var rootsMatch = _activeRoots.SequenceEqual(roots, StringComparer.OrdinalIgnoreCase);
@@ -1888,6 +1904,7 @@ public sealed class McpInfrastructureService : IDisposable
             }
             ErrorLog.Write("McpInfrastructureService.ReconcileFilesystemServerAsync", exception);
             _activeFilesystemFingerprint = string.Empty;
+            status.MissingDependency = false;
             status.HealthState = McpServerHealthState.Quarantine;
             status.StatusText = I18n.Tr("Ошибка запуска Filesystem MCP: ", "Filesystem MCP startup error: ") + exception.Message;
             status.ToolsCount = 0;
@@ -2929,9 +2946,15 @@ public sealed class McpInfrastructureService : IDisposable
                     ApplyDesiredEnabledToStatus(status, true);
                     continue;
                 }
+                if (state.Pending && previousHealthState == McpServerHealthState.Quarantine)
+                {
+                    continue;
+                }
                 status.ToolsCount = Math.Max(0, state.ToolsCount);
                 status.TotalToolsCount = Math.Max(0, state.TotalToolsCount);
                 status.AllToolsDisabled = state.AllToolsDisabled;
+                status.NoAllowedDirectories = IsNoAllowedDirectories(state.ServerId);
+                status.LastResponseTimeMs = state.ResponseTimeMs;
                 status.ToolsPreview = state.ToolsPreview != null
                     ? string.Join(", ", state.ToolsPreview.Take(6))
                     : string.Empty;
@@ -2956,11 +2979,7 @@ public sealed class McpInfrastructureService : IDisposable
                     case McpServerHealthState.Online:
                         if (string.Equals(state.Transport, "stdio", StringComparison.OrdinalIgnoreCase))
                             MarkServerPackageReady(state.ServerId);
-                        status.StatusText = state.AllToolsDisabled
-                            ? I18n.Tr("Подключён и активен · 0 активных инструментов", "Connected & active · 0 active tools")
-                            : I18n.Tr("Подключён и активен", "Connected & active");
-                        if (state.ResponseTimeMs.HasValue)
-                            status.StatusText += " · " + state.ResponseTimeMs.Value + " ms";
+                        status.StatusText = BuildOnlineStatusText(state.ServerId, state.AllToolsDisabled, state.ResponseTimeMs);
                         break;
 
                     case McpServerHealthState.LoadingTools:
@@ -3175,11 +3194,14 @@ public sealed class McpInfrastructureService : IDisposable
                 await StopChildAsync(_binaryMcp).ConfigureAwait(false);
                 _binaryMcp = null;
             }
+            status.MissingDependency = true;
             status.HealthState = McpServerHealthState.Quarantine;
             status.ToolsCount = 0;
             status.StatusText = BuildNodeDependencyUnavailableMessage(dependencies);
             return;
         }
+
+        status.MissingDependency = false;
 
         WriteBinaryRootsFile(roots);
         var alive = _binaryMcp != null && !IsExited(_binaryMcp.Process);
@@ -3271,6 +3293,8 @@ public sealed class McpInfrastructureService : IDisposable
         if (!dependencies.HasNode || !dependencies.HasFilesystemMcp || !dependencies.HasSupergateway)
             throw new InvalidOperationException(BuildFilesystemDependencyUnavailableMessage(dependencies));
 
+        if (roots.Length == 0)
+            Directory.CreateDirectory(AppPaths.EmptyFilesystemRootDirectory);
         var effectiveRoots = roots.Length == 0 ? new[] { AppPaths.EmptyFilesystemRootDirectory } : roots;
         var custom = _filesystemCustom;
         var customCommand = custom?.Command;
@@ -4019,6 +4043,50 @@ public sealed class McpInfrastructureService : IDisposable
         child.TryTerminateJob(out _);
         child.DisposeJob();
         PublishCurrentSnapshot();
+        if (!_stopping)
+            _ = PollManagedProcessesSafelyAsync();
+    }
+
+    private bool IsNoAllowedDirectories(string serverId) =>
+        (string.Equals(serverId, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase) ||
+         string.Equals(serverId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase)) &&
+        _desiredRoots.Length == 0;
+
+    private string BuildOnlineStatusText(string serverId, bool allToolsDisabled, int? responseTimeMs)
+    {
+        var noAllowedRoots = IsNoAllowedDirectories(serverId);
+
+        var parts = new List<string>(3);
+        if (allToolsDisabled)
+            parts.Add(I18n.Tr("0 активных инструментов", "0 active tools"));
+        if (noAllowedRoots)
+            parts.Add(I18n.Tr(
+                parts.Count == 0 ? "Нет разрешённых директорий" : "нет разрешённых директорий",
+                parts.Count == 0 ? "No allowed directories" : "no allowed directories"));
+        if (responseTimeMs.HasValue)
+            parts.Add(responseTimeMs.Value + " ms");
+
+        return string.Join(" · ", parts);
+    }
+
+    private void RefreshOnlineRootsScopedStatuses()
+    {
+        lock (_stateLock)
+        {
+            foreach (var id in new[] { SettingsStore.BuiltInFilesystemId, SettingsStore.BuiltInBinaryId })
+            {
+                if (_statusById.TryGetValue(id, out var st))
+                {
+                    st.NoAllowedDirectories = IsNoAllowedDirectories(id);
+                    if (st.IsEnabled && st.HealthState == McpServerHealthState.Online)
+                    {
+                        st.StatusText = BuildOnlineStatusText(id, st.AllToolsDisabled, st.LastResponseTimeMs);
+                        if (string.Equals(id, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase))
+                            _filesystemStatus = st.StatusText;
+                    }
+                }
+            }
+        }
     }
 
     private List<ServerRuntimeStatus> GetOrderedStatusList()
@@ -4053,7 +4121,7 @@ public sealed class McpInfrastructureService : IDisposable
         {
             fpBuilder.Append('|').Append(s.Id).Append(':').Append(s.IsEnabled).Append(':')
                      .Append((int)s.HealthState).Append(':').Append(s.DisplayStatusText).Append(':')
-                     .Append(s.ToolsCount).Append(':').Append(s.TotalToolsCount).Append(':').Append(s.AllToolsDisabled).Append(':').Append(s.EndpointDisplay).Append(':').Append(s.PathDisplay);
+                     .Append(s.ToolsCount).Append(':').Append(s.TotalToolsCount).Append(':').Append(s.AllToolsDisabled).Append(':').Append(s.NoAllowedDirectories).Append(':').Append(s.EndpointDisplay).Append(':').Append(s.PathDisplay);
         }
         var currentFp = fpBuilder.ToString();
         if (string.Equals(_lastPublishedUiFingerprint, currentFp, StringComparison.Ordinal))
@@ -4228,16 +4296,19 @@ public sealed class McpInfrastructureService : IDisposable
         public int ToolsCount { get; set; }
         public int TotalToolsCount { get; set; }
         public bool AllToolsDisabled { get; set; }
+        public bool NoAllowedDirectories { get; set; }
         public string ToolsPreview { get; set; } = string.Empty;
         public string LastDiagnosticLog { get; set; } = string.Empty;
         public string LastFingerprint { get; set; } = string.Empty;
         public bool RuntimeStartFailed { get; set; }
+        public bool MissingDependency { get; set; }
+        public int? LastResponseTimeMs { get; set; }
         public int DependentLocalPort { get; set; }
         public McpServerStatusSnapshot ToSnapshot() => new()
         {
             Id = Id, Name = Name, Subtitle = Subtitle, EndpointDisplay = EndpointDisplay, PathDisplay = PathDisplay,
             TransportBadge = TransportBadge, IsBuiltIn = IsBuiltIn, IsEnabled = IsEnabled, HealthState = HealthState,
-            StatusText = StatusText, ToolsCount = ToolsCount, TotalToolsCount = TotalToolsCount, AllToolsDisabled = AllToolsDisabled, ToolsPreview = ToolsPreview, LastDiagnosticLog = LastDiagnosticLog
+            StatusText = StatusText, ToolsCount = ToolsCount, TotalToolsCount = TotalToolsCount, AllToolsDisabled = AllToolsDisabled, NoAllowedDirectories = NoAllowedDirectories, ToolsPreview = ToolsPreview, LastDiagnosticLog = LastDiagnosticLog
         };
     }
 

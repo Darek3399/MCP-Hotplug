@@ -531,7 +531,7 @@
                                                                     <Border Grid.Column="0" Background="{Binding BadgeBackground}" BorderBrush="{Binding BadgeBorder}" BorderThickness="1" CornerRadius="2" UseLayoutRounding="False" Padding="8,3" Margin="0,0,10,0" VerticalAlignment="Center">
                                                                         <TextBlock Text="{Binding BadgeText}" FontSize="10" FontWeight="SemiBold" Padding="0,0,0,1" Foreground="{Binding BadgeForeground}"/>
                                                                     </Border>
-                                                                    <TextBlock Grid.Column="1" Text="{Binding DisplayStatusText}" Foreground="{Binding BadgeForeground}" FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                                                                    <TextBlock Grid.Column="1" Text="{Binding DisplayStatusText}" Foreground="{Binding StatusTextForeground}" FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
                                                                                ToolTipService.InitialShowDelay="350" ToolTipOpening="TrimmedTextBlock_ToolTipOpening" Tag="{Binding DisplayStatusText}">
                                                                         <TextBlock.ToolTip><ToolTip Style="{StaticResource McpTableCellToolTipStyle}" Content="{Binding DisplayStatusText}"/></TextBlock.ToolTip>
                                                                     </TextBlock>
@@ -699,7 +699,7 @@
                                                                 </StackPanel>
 
                                                                 <TextBlock Grid.Column="3" Text="{Binding DisplayStatusText}" FontSize="11.5"
-                                                                           Foreground="{Binding BadgeForeground}" VerticalAlignment="Center"
+                                                                           Foreground="{Binding StatusTextForeground}" VerticalAlignment="Center"
                                                                            TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Margin="0,0,14,0"
                                                                            ToolTipService.InitialShowDelay="350"
                                                                            ToolTipOpening="TrimmedTextBlock_ToolTipOpening" Tag="{Binding DisplayStatusText}">

@@ -119,7 +119,8 @@ $embeddedPayloadRoots = @(
     $publishDirectory,
     $dependenciesDirectory,
     (Join-Path $PSScriptRoot 'TailscaleSetup.ps1'),
-    (Join-Path $PSScriptRoot 'Uninstall-Tailscale.ps1')
+    (Join-Path $PSScriptRoot 'Uninstall-Tailscale.ps1'),
+    (Join-Path $PSScriptRoot 'Stop-McpHotplugRuntime.ps1')
 )
 
 $embeddedPayloadBytes = [long]0

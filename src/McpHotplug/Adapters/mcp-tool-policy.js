@@ -273,21 +273,19 @@ function detectMetaPattern(tools) {
   if (safeTools.length < 2) return null;
 
   // Step A: Find proxy dispatcher (executor) by invariant schema signature:
-  // - Not readOnlyHint: true
+  // - Prefer tools without readOnlyHint: true, with fallback to readOnlyHint: true
+  //   only when no non-read-only dispatcher matches (e.g. nested MCP Hotplug gateway).
   // - Exactly 1 open-object parameter (arbitrary argument bag)
   // - At least 1 required free-string parameter (target tool identifier)
   // - Remaining parameters are free strings or optional simple scalars
-  const dispatchers = [];
-  for (const t of safeTools) {
-    if (isReadOnlyTool(t)) continue;
+  function matchDispatcher(t) {
     const props = getSchemaProps(t);
     const entries = Object.entries(props);
-    if (entries.length < 2 || entries.length > 8) continue;
+    if (entries.length < 2 || entries.length > 8) return null;
 
     const reqSet = new Set(getSchemaRequired(t));
     const openObjParams = [];
     const stringParams = [];
-    let valid = true;
 
     for (const [k, prop] of entries) {
       if (isOpenObjectSchema(prop)) {
@@ -297,23 +295,36 @@ function detectMetaPattern(tools) {
       } else if (!reqSet.has(k) && isSimpleScalarSchema(prop)) {
         // Optional scalar knobs (e.g. timeout, dry_run, format) are permitted.
       } else {
-        valid = false;
-        break;
+        return null;
       }
     }
 
-    if (!valid || openObjParams.length !== 1 || stringParams.length === 0) continue;
-    if (!stringParams.some(p => p.required)) continue;
+    if (openObjParams.length !== 1 || stringParams.length === 0) return null;
+    if (!stringParams.some(p => p.required)) return null;
 
     const requiredStrings = stringParams.filter(p => p.required).map(p => p.name);
     const optionalStrings = stringParams.filter(p => !p.required).map(p => p.name);
-    dispatchers.push({
+    return {
       name: t.name,
       argsParam: openObjParams[0],
       stringParams,
       toolParam: requiredStrings[0],
       groupParam: optionalStrings[0] || (requiredStrings.length >= 2 ? requiredStrings[1] : null)
-    });
+    };
+  }
+
+  const dispatchers = [];
+  for (const t of safeTools) {
+    if (isReadOnlyTool(t)) continue;
+    const matched = matchDispatcher(t);
+    if (matched) dispatchers.push(matched);
+  }
+  if (dispatchers.length === 0) {
+    for (const t of safeTools) {
+      if (!isReadOnlyTool(t)) continue;
+      const matched = matchDispatcher(t);
+      if (matched) dispatchers.push(matched);
+    }
   }
 
   if (dispatchers.length === 0) return null;

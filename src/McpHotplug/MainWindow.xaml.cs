@@ -278,8 +278,16 @@ public partial class MainWindow : Window
 
     private IntPtr WindowMessageHook(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
+        const int WmEndSession = 0x0016;
         const int WmGetMinMaxInfo = 0x0024;
         const uint MonitorDefaultToNearest = 2;
+        if (message == WmEndSession && wParam != IntPtr.Zero)
+        {
+            _exitRequested = true;
+            if (!_cleanupStarted && !_cleanupCompleted)
+                Dispatcher.BeginInvoke(new Action(Close));
+            return IntPtr.Zero;
+        }
         if (message != WmGetMinMaxInfo) return IntPtr.Zero;
 
         var monitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
@@ -2200,7 +2208,7 @@ public partial class MainWindow : Window
             if (!File.Exists(AppPaths.UpdaterExecutable))
                 throw new FileNotFoundException(I18n.Tr("Не найден скрытый компонент обновления.", "The background updater helper was not found."), AppPaths.UpdaterExecutable);
 
-            var arguments = JoinWindowsArguments(new[]
+            var arguments = new[]
             {
                 "--start",
                 update.LocalInstallerPath,
@@ -2209,20 +2217,15 @@ public partial class MainWindow : Window
                 Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture),
                 I18n.IsEnglish ? "en" : "ru",
                 update.Sha256
-            });
+            };
 
-            var updater = Process.Start(new ProcessStartInfo
-            {
-                FileName = AppPaths.UpdaterExecutable,
-                Arguments = arguments,
-                WorkingDirectory = AppPaths.UpdatesDirectory,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            });
-
-            if (updater == null)
-                throw new InvalidOperationException(I18n.Tr("Не удалось запустить фоновый компонент обновления.", "Could not start the background updater helper."));
+            // Launch with bInheritHandles = false so the background updater cannot
+            // inherit open listening sockets (such as 127.0.0.1:18006).
+            DetachedProcessLauncher.Start(
+                AppPaths.UpdaterExecutable,
+                arguments,
+                AppPaths.UpdatesDirectory,
+                hideWindow: true);
 
             ErrorLog.LogApp(I18n.Tr("Запущен установщик обновления v" + update.VersionLabel + ".", "Updater launched for v" + update.VersionLabel + "."));
             _exitRequested = true;
@@ -2245,37 +2248,6 @@ public partial class MainWindow : Window
     {
         UpdateStatusText.Text = message;
         UpdateStatusText.Visibility = string.IsNullOrWhiteSpace(message) ? Visibility.Collapsed : Visibility.Visible;
-    }
-
-    private static string JoinWindowsArguments(IEnumerable<string> arguments) =>
-        string.Join(" ", arguments.Select(QuoteWindowsArgument));
-
-    private static string QuoteWindowsArgument(string value)
-    {
-        var result = new System.Text.StringBuilder();
-        result.Append('"');
-        var backslashes = 0;
-        foreach (var character in value)
-        {
-            if (character == '\\')
-            {
-                backslashes++;
-                continue;
-            }
-            if (character == '"')
-            {
-                result.Append('\\', backslashes * 2 + 1);
-                result.Append('"');
-                backslashes = 0;
-                continue;
-            }
-            result.Append('\\', backslashes);
-            backslashes = 0;
-            result.Append(character);
-        }
-        result.Append('\\', backslashes * 2);
-        result.Append('"');
-        return result.ToString();
     }
 
     private void AutoStart_Click(object sender, RoutedEventArgs e)
@@ -2365,6 +2337,7 @@ public partial class MainWindow : Window
         }
         finally
         {
+            try { _tailscaleManager.Dispose(); } catch { }
             _cleanupCompleted = true;
             try { _logsRefreshTimer?.Stop(); } catch { }
             try { _logsWatcher?.Dispose(); } catch { }
