@@ -29,6 +29,12 @@ namespace McpHotplug;
 
 public partial class MainWindow : Window
 {
+#if TEST_BUILD
+    private const bool IsTestBuild = true;
+#else
+    private const bool IsTestBuild = false;
+#endif
+
     private readonly SettingsStore _settingsStore = new();
     private readonly ObservableCollection<RootPathItemViewModel> _rootItems = new();
     private readonly ObservableCollection<McpServerStatusSnapshot> _serverItems = new();
@@ -72,6 +78,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         WindowChromeHelper.Configure(this, MainWindowBorder, MainWindowRootGrid, 5.0);
         InitializeAppVersion();
+        ApplyTestBuildPresentation();
         SourceInitialized += MainWindow_SourceInitialized;
 
         var brandWindowIcon = CreateBrandWindowIcon();
@@ -231,7 +238,9 @@ public partial class MainWindow : Window
         var icon = new Forms.NotifyIcon
         {
             Icon = CreateBrandTrayIcon(),
-            Text = "MCP Hotplug — оркестратор активен",
+            Text = IsTestBuild
+                ? "[TEST] MCP Hotplug — тестовая сборка"
+                : "MCP Hotplug — оркестратор активен",
             ContextMenuStrip = menu,
             Visible = true
         };
@@ -581,10 +590,16 @@ public partial class MainWindow : Window
 
         if (_trayMenu.Items.Count >= 3)
         {
-            _trayMenu.Items[0].Text = I18n.Tr("Открыть MCP Hotplug", "Open MCP Hotplug");
+            _trayMenu.Items[0].Text = IsTestBuild
+                ? I18n.Tr("Открыть MCP Hotplug [TEST]", "Open MCP Hotplug [TEST]")
+                : I18n.Tr("Открыть MCP Hotplug", "Open MCP Hotplug");
             _trayMenu.Items[2].Text = I18n.Tr("Выход", "Exit");
         }
-        _trayIcon.Text = I18n.Tr("MCP Hotplug — оркестратор активен", "MCP Hotplug — orchestrator active");
+        _trayIcon.Text = IsTestBuild
+            ? I18n.Tr("[TEST] MCP Hotplug — тестовая сборка", "[TEST] MCP Hotplug — TEST BUILD")
+            : I18n.Tr("MCP Hotplug — оркестратор активен", "MCP Hotplug — orchestrator active");
+        if (TestBuildBannerText != null)
+            TestBuildBannerText.Text = I18n.Tr("ТЕСТОВАЯ СБОРКА · НЕ ДЛЯ РЕЛИЗА", "TEST BUILD · NOT FOR RELEASE");
 
         if (PresetsItemsControl != null)
         {
@@ -694,6 +709,10 @@ public partial class MainWindow : Window
         else if (string.Equals(serverId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase))
         {
             _settings.HotplugControlMcpEnabled = isEnabled;
+        }
+        else if (string.Equals(serverId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase))
+        {
+            _settings.UnrealBuildMcpEnabled = isEnabled;
         }
         else
         {
@@ -882,6 +901,14 @@ public partial class MainWindow : Window
                         updated = true;
                     }
                 }
+                else if (string.Equals(serverId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase))
+                {
+                    if ((_settings.UnrealBuildMcpEnabled == true) != isEnabled)
+                    {
+                        _settings.UnrealBuildMcpEnabled = isEnabled;
+                        updated = true;
+                    }
+                }
                 else
                 {
                     var custom = _settings.CustomServers.FirstOrDefault(s => string.Equals(s.Id, serverId, StringComparison.OrdinalIgnoreCase));
@@ -996,6 +1023,7 @@ public partial class MainWindow : Window
                                string.Equals(baseId, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase) ||
                                string.Equals(baseId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase) ||
                                string.Equals(baseId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase) ||
+                               string.Equals(baseId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase) ||
                                (candidate.Args != null && candidate.Args.Any(a => a != null && a.IndexOf("server-filesystem", StringComparison.OrdinalIgnoreCase) >= 0));
             var existingDup = _settings.CustomServers.FirstOrDefault(s =>
                 string.Equals(s.Id, baseId, StringComparison.OrdinalIgnoreCase) ||
@@ -1130,6 +1158,21 @@ public partial class MainWindow : Window
             if (renameDlg.ShowDialog() != true || string.IsNullOrWhiteSpace(renameDlg.ServerName)) return;
             _settings.HotplugControlMcpCustom ??= new CustomMcpServerEntry { Id = SettingsStore.BuiltInHotplugControlId, Transport = "http" };
             _settings.HotplugControlMcpCustom.Name = renameDlg.ServerName;
+            if (!SaveSettings()) return;
+            await SyncMcpInfrastructureAsync();
+            return;
+        }
+        if (string.Equals(serverId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase))
+        {
+            var currentBuildName = _settings.UnrealBuildMcpCustom?.Name ?? "Unreal Build MCP";
+            var renameDlg = new FilesystemRenameDialog(
+                currentBuildName,
+                I18n.Tr("Переименовать Unreal Build MCP", "Rename Unreal Build MCP"),
+                I18n.Tr("Отображаемое имя для Unreal Build MCP:", "Display name for Unreal Build MCP:"))
+            { Owner = this };
+            if (renameDlg.ShowDialog() != true || string.IsNullOrWhiteSpace(renameDlg.ServerName)) return;
+            _settings.UnrealBuildMcpCustom ??= new CustomMcpServerEntry { Id = SettingsStore.BuiltInUnrealBuildId, Transport = "http" };
+            _settings.UnrealBuildMcpCustom.Name = renameDlg.ServerName;
             if (!SaveSettings()) return;
             await SyncMcpInfrastructureAsync();
             return;
@@ -1356,7 +1399,8 @@ public partial class MainWindow : Window
 
         if (string.Equals(serverId, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(serverId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase))
+            string.Equals(serverId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(serverId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase))
             return;
 
         if (string.Equals(serverId, SettingsStore.BuiltInUnrealId, StringComparison.OrdinalIgnoreCase))
@@ -1413,6 +1457,7 @@ public partial class MainWindow : Window
             _settings.FilesystemMcpEnabled = enableAll || enabledSet.Contains(SettingsStore.BuiltInFilesystemId);
         _settings.BinaryMcpEnabled = enableAll || enabledSet.Contains(SettingsStore.BuiltInBinaryId);
         _settings.HotplugControlMcpEnabled = enableAll || enabledSet.Contains(SettingsStore.BuiltInHotplugControlId);
+        _settings.UnrealBuildMcpEnabled = enableAll || enabledSet.Contains(SettingsStore.BuiltInUnrealBuildId);
 
         foreach (var srv in _settings.CustomServers)
             srv.Enabled = enableAll || enabledSet.Contains(srv.Id);
@@ -1478,6 +1523,11 @@ public partial class MainWindow : Window
         {
             enabledIds.Add(SettingsStore.BuiltInHotplugControlId);
             enabledNames.Add(_settings.HotplugControlMcpCustom?.Name ?? "Hotplug Control MCP");
+        }
+        if (_settings.UnrealBuildMcpEnabled == true)
+        {
+            enabledIds.Add(SettingsStore.BuiltInUnrealBuildId);
+            enabledNames.Add(_settings.UnrealBuildMcpCustom?.Name ?? "Unreal Build MCP");
         }
         foreach (var srv in _settings.CustomServers.Where(s => s.Enabled))
         {
@@ -2270,7 +2320,7 @@ public partial class MainWindow : Window
             try { _tailscaleManager.Dispose(); } catch { }
         }
 
-        var corePorts = new[] { 18006, 8001, 8003, 8004, 8005 };
+        var corePorts = new[] { 18006, 8001, 8003, 8004, 8005, 8006 };
         var deadline = DateTime.UtcNow.AddSeconds(6);
         while (DateTime.UtcNow < deadline)
         {
@@ -2800,11 +2850,32 @@ public partial class MainWindow : Window
                     versionText = versionText.Substring(0, metadataSeparator);
             }
 
-            AppVersionText.Text = string.IsNullOrWhiteSpace(versionText) ? "v—" : $"v{versionText}";
+            if (IsTestBuild && !string.IsNullOrWhiteSpace(versionText) &&
+                !versionText!.EndsWith("-TEST", StringComparison.OrdinalIgnoreCase))
+            {
+                versionText += "-TEST";
+            }
+
+            AppVersionText.Text = string.IsNullOrWhiteSpace(versionText)
+                ? (IsTestBuild ? "v—-TEST" : "v—")
+                : $"v{versionText}";
         }
         catch
         {
-            AppVersionText.Text = "v—";
+            AppVersionText.Text = IsTestBuild ? "v—-TEST" : "v—";
+        }
+    }
+
+    private void ApplyTestBuildPresentation()
+    {
+        if (!IsTestBuild) return;
+        Title = "MCP Hotplug [TEST]";
+        if (TestBuildBanner != null)
+            TestBuildBanner.Visibility = Visibility.Visible;
+        if (AppVersionText != null)
+        {
+            AppVersionText.Foreground = new SolidColorBrush(Color.FromRgb(255, 110, 80));
+            AppVersionText.FontWeight = FontWeights.Bold;
         }
     }
 
@@ -2874,6 +2945,7 @@ public partial class MainWindow : Window
         public bool FilesystemEnabled { get; set; }
         public bool BinaryEnabled { get; set; }
         public bool HotplugControlEnabled { get; set; }
+        public bool UnrealBuildEnabled { get; set; }
         public string? ActivePresetId { get; set; }
         public Dictionary<string, bool> CustomEnabledById { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, List<string>> DisabledToolsByServer { get; set; } = new(StringComparer.OrdinalIgnoreCase);
@@ -2907,6 +2979,7 @@ public partial class MainWindow : Window
                 FilesystemEnabled = settings.FilesystemMcpEnabled != false,
                 BinaryEnabled = settings.BinaryMcpEnabled != false,
                 HotplugControlEnabled = settings.HotplugControlMcpEnabled == true,
+                UnrealBuildEnabled = settings.UnrealBuildMcpEnabled == true,
                 ActivePresetId = settings.ActivePresetId,
                 CustomEnabledById = customMap,
                 DisabledToolsByServer = disabledMap
@@ -2919,6 +2992,7 @@ public partial class MainWindow : Window
                 FilesystemEnabled != other.FilesystemEnabled ||
                 BinaryEnabled != other.BinaryEnabled ||
                 HotplugControlEnabled != other.HotplugControlEnabled ||
+                UnrealBuildEnabled != other.UnrealBuildEnabled ||
                 !string.Equals(ActivePresetId, other.ActivePresetId, StringComparison.OrdinalIgnoreCase))
                 return false;
 
@@ -2960,6 +3034,11 @@ public partial class MainWindow : Window
             {
                 settings.HotplugControlMcpEnabled = HotplugControlEnabled;
                 changedServers[SettingsStore.BuiltInHotplugControlId] = HotplugControlEnabled;
+            }
+            if ((settings.UnrealBuildMcpEnabled == true) != UnrealBuildEnabled)
+            {
+                settings.UnrealBuildMcpEnabled = UnrealBuildEnabled;
+                changedServers[SettingsStore.BuiltInUnrealBuildId] = UnrealBuildEnabled;
             }
             foreach (var srv in settings.CustomServers ?? new List<CustomMcpServerEntry>())
             {

@@ -229,7 +229,7 @@ function Stop-OwnedProcessTrees {
 
 function Wait-ForTerminatedProcessesAndPorts([System.Collections.Generic.HashSet[int]]$TargetedPids) {
     $deadline = [DateTime]::UtcNow.AddSeconds(6)
-    $managedPorts = @(8001, 8003, 8004, 8005, 18006) + (8010..8099)
+    $managedPorts = @(8001, 8003, 8004, 8005, 8006, 18006) + (8010..8099)
 
     while ([DateTime]::UtcNow -lt $deadline) {
         $stillAlive = $false

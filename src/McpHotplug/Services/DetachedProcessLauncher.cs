@@ -15,6 +15,8 @@ namespace McpHotplug.Services;
 internal static class DetachedProcessLauncher
 {
     private const uint CreateNoWindow = 0x08000000;
+    private const uint CreateBreakawayFromJob = 0x01000000;
+    private const int ErrorAccessDenied = 5;
     private const int StartfUseShowWindow = 0x00000001;
     private const short SwHide = 0;
 
@@ -23,6 +25,16 @@ internal static class DetachedProcessLauncher
         IEnumerable<string> arguments,
         string? workingDirectory,
         bool hideWindow)
+    {
+        StartAndGetPid(executablePath, arguments, workingDirectory, hideWindow, breakawayFromJob: false);
+    }
+
+    public static int StartAndGetPid(
+        string executablePath,
+        IEnumerable<string> arguments,
+        string? workingDirectory,
+        bool hideWindow,
+        bool breakawayFromJob = false)
     {
         if (string.IsNullOrWhiteSpace(executablePath))
             throw new ArgumentException("Executable path must not be empty.", nameof(executablePath));
@@ -45,29 +57,50 @@ internal static class DetachedProcessLauncher
             startupInfo.wShowWindow = SwHide;
         }
 
-        var creationFlags = hideWindow ? CreateNoWindow : 0u;
+        var baseFlags = hideWindow ? CreateNoWindow : 0u;
+        var creationFlags = breakawayFromJob ? (baseFlags | CreateBreakawayFromJob) : baseFlags;
         var currentDirectory = string.IsNullOrWhiteSpace(workingDirectory) ? null : workingDirectory;
 
-        if (!CreateProcess(
+        var started = CreateProcess(
+            executablePath,
+            commandLine,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            false,
+            creationFlags,
+            IntPtr.Zero,
+            currentDirectory,
+            ref startupInfo,
+            out var processInfo);
+
+        if (!started && breakawayFromJob && Marshal.GetLastWin32Error() == ErrorAccessDenied)
+        {
+            var retryCommandLine = new StringBuilder(commandLine.ToString());
+            started = CreateProcess(
                 executablePath,
-                commandLine,
+                retryCommandLine,
                 IntPtr.Zero,
                 IntPtr.Zero,
                 false,
-                creationFlags,
+                baseFlags,
                 IntPtr.Zero,
                 currentDirectory,
                 ref startupInfo,
-                out var processInfo))
+                out processInfo);
+        }
+
+        if (!started)
         {
             var error = Marshal.GetLastWin32Error();
             throw new Win32Exception(error, "CreateProcess failed for " + executablePath + " (Win32=" + error + ").");
         }
 
+        var pid = processInfo.dwProcessId;
         if (processInfo.hThread != IntPtr.Zero)
             CloseHandle(processInfo.hThread);
         if (processInfo.hProcess != IntPtr.Zero)
             CloseHandle(processInfo.hProcess);
+        return pid;
     }
 
     public static string QuoteArgument(string value)

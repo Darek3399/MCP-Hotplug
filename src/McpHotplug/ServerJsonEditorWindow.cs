@@ -836,10 +836,13 @@ public sealed class ServerJsonEditorWindow : Window
                     "Filesystem MCP уже встроен в систему. Настройте разрешённые папки в существующем Filesystem MCP вместо повторного добавления.",
                     "Filesystem MCP is already built in. Configure allowed folders in the existing Filesystem MCP instead of adding it again."));
 
-            if (string.Equals(candidate.Id, SettingsStore.BuiltInUnrealId, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(candidate.Id, SettingsStore.BuiltInUnrealId, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(candidate.Id, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(candidate.Id, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(candidate.Id, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase))
                 throw new FormatException(I18n.Tr(
-                    "Сервер с идентификатором unreal уже существует. Отредактируйте существующий сервер или укажите другое имя.",
-                    "A server with ID 'unreal' already exists. Edit the existing server or choose a different name."));
+                    "Сервер с идентификатором " + candidate.Id + " уже встроен в систему. Отредактируйте существующий сервер или укажите другое имя.",
+                    "A server with ID '" + candidate.Id + "' is already built in. Edit the existing server or choose a different name."));
 
             try
             {

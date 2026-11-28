@@ -23,6 +23,13 @@
     <Optimize>true</Optimize>
     <DebugType>none</DebugType>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(TestBuild)' == 'true'">
+    <DefineConstants>$(DefineConstants);TEST_BUILD</DefineConstants>
+    <InformationalVersion>$(Version)-TEST</InformationalVersion>
+    <AssemblyTitle>MCP Hotplug [TEST]</AssemblyTitle>
+    <Product>MCP Hotplug [TEST]</Product>
+    <FileDescription>MCP Hotplug TEST BUILD (NOT FOR RELEASE)</FileDescription>
+  </PropertyGroup>
   <ItemGroup>
     <!-- Исключаем глобальные конфликты имён между WPF и WinForms/Drawing -->
     <Using Remove="System.Windows.Forms" />

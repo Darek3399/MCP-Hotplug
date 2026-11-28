@@ -63,6 +63,7 @@ public sealed class McpInfrastructureService : IDisposable
     private static readonly string BinaryEndpoint = LoopbackPrefix + "8005/mcp";
     private static readonly string BinaryHealthEndpoint = LoopbackPrefix + "8005/__manager/health";
     private static readonly string BinaryRootsEndpoint = LoopbackPrefix + "8005/__manager/roots";
+    private static readonly string UnrealBuildEndpoint = LoopbackPrefix + "8006/mcp";
     private static readonly string HotplugControlEndpoint = LoopbackPrefix + "8001/__control/mcp";
     private static readonly string FilteredEndpoint = LoopbackPrefix + "8001/mcp";
     private static readonly string HotplugEndpoint = LoopbackPrefix + "8004/mcp";
@@ -72,6 +73,7 @@ public sealed class McpInfrastructureService : IDisposable
     private const string ProtocolVersion = "2025-06-18";
     private const int FilesystemPort = 8003;
     private const int BinaryPort = 8005;
+    private const int UnrealBuildPort = 8006;
     private const int FilterPort = 8001;
     private const int HotplugMcpPort = 8004;
     private const int CustomPortRangeStart = 8010;
@@ -93,6 +95,7 @@ public sealed class McpInfrastructureService : IDisposable
     private readonly Dictionary<string, bool> _desiredEnabledById = new(StringComparer.OrdinalIgnoreCase);
     private volatile ManagedChild? _filesystemGateway;
     private volatile ManagedChild? _binaryMcp;
+    private UnrealBuildMcpServer? _unrealBuildServer;
     private volatile ManagedChild? _rootsFilter;
     private volatile ManagedChild? _hotplugGateway;
     private DateTime _nextHotplugGatewayRetryUtc = DateTime.MinValue;
@@ -120,6 +123,8 @@ public sealed class McpInfrastructureService : IDisposable
     private CustomMcpServerEntry? _binaryCustom;
     private bool _hotplugControlEnabled = false;
     private CustomMcpServerEntry? _hotplugControlCustom;
+    private bool _unrealBuildEnabled = false;
+    private CustomMcpServerEntry? _unrealBuildCustom;
     private Dictionary<string, List<string>> _disabledToolsByServer = new(StringComparer.OrdinalIgnoreCase);
     private List<CustomMcpServerEntry> _customServers = new();
 
@@ -164,6 +169,8 @@ public sealed class McpInfrastructureService : IDisposable
                 _binaryEnabled = isEnabled;
             else if (string.Equals(serverId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase))
                 _hotplugControlEnabled = isEnabled;
+            else if (string.Equals(serverId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase))
+                _unrealBuildEnabled = isEnabled;
             else
             {
                 var custom = _customServers.FirstOrDefault(s => string.Equals(s.Id, serverId, StringComparison.OrdinalIgnoreCase));
@@ -218,6 +225,8 @@ public sealed class McpInfrastructureService : IDisposable
         _binaryEnabled = settings.BinaryMcpEnabled ?? false;
         _hotplugControlCustom = settings.HotplugControlMcpCustom?.Clone();
         _hotplugControlEnabled = settings.HotplugControlMcpEnabled ?? false;
+        _unrealBuildCustom = settings.UnrealBuildMcpCustom?.Clone();
+        _unrealBuildEnabled = settings.UnrealBuildMcpEnabled ?? false;
         _disabledToolsByServer = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         if (settings.DisabledToolsByServer != null)
         {
@@ -232,6 +241,7 @@ public sealed class McpInfrastructureService : IDisposable
         _desiredEnabledById[SettingsStore.BuiltInFilesystemId] = _filesystemEnabled;
         _desiredEnabledById[SettingsStore.BuiltInBinaryId] = _binaryEnabled;
         _desiredEnabledById[SettingsStore.BuiltInHotplugControlId] = _hotplugControlEnabled;
+        _desiredEnabledById[SettingsStore.BuiltInUnrealBuildId] = _unrealBuildEnabled;
         foreach (var s in _customServers)
             _desiredEnabledById[s.Id] = s.Enabled;
 
@@ -341,6 +351,33 @@ public sealed class McpInfrastructureService : IDisposable
             ApplyDesiredEnabledToStatus(ctrlStatus, _hotplugControlEnabled);
         }
 
+        var ueBuildName = (_unrealBuildCustom != null && !string.IsNullOrWhiteSpace(_unrealBuildCustom.Name))
+            ? _unrealBuildCustom.Name!
+            : "Unreal Build MCP";
+        if (!_statusById.TryGetValue(SettingsStore.BuiltInUnrealBuildId, out var ueBuildStatus))
+        {
+            _statusById[SettingsStore.BuiltInUnrealBuildId] = new ServerRuntimeStatus
+            {
+                Id = SettingsStore.BuiltInUnrealBuildId,
+                Name = ueBuildName,
+                Subtitle = I18n.Tr("Сборка C++ (UBT) и перезапуск Unreal Editor", "C++ build (UBT) & Unreal Editor restart"),
+                EndpointDisplay = "8006",
+                PathDisplay = "/mcp",
+                TransportBadge = "BUILT-IN",
+                UpstreamUrl = UnrealBuildEndpoint,
+                IsBuiltIn = true,
+                IsEnabled = _unrealBuildEnabled,
+                HealthState = _unrealBuildEnabled ? McpServerHealthState.Waiting : McpServerHealthState.Disabled,
+                StatusText = _unrealBuildEnabled ? I18n.Tr("Установка связи MCP…", "Establishing MCP connection…") : I18n.Tr("Выключен", "Disabled")
+            };
+        }
+        else
+        {
+            ueBuildStatus.Name = ueBuildName;
+            ueBuildStatus.Subtitle = I18n.Tr("Сборка C++ (UBT) и перезапуск Unreal Editor", "C++ build (UBT) & Unreal Editor restart");
+            ApplyDesiredEnabledToStatus(ueBuildStatus, _unrealBuildEnabled);
+        }
+
         foreach (var server in _customServers)
         {
             if (_statusById.TryGetValue(server.Id, out var existingStatus))
@@ -404,6 +441,7 @@ public sealed class McpInfrastructureService : IDisposable
             string.Equals(serverId, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(serverId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInUnrealId, StringComparison.OrdinalIgnoreCase))
             return true;
         try
@@ -432,6 +470,7 @@ public sealed class McpInfrastructureService : IDisposable
             string.Equals(serverId, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(serverId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInUnrealId, StringComparison.OrdinalIgnoreCase))
             return;
         try
@@ -451,6 +490,7 @@ public sealed class McpInfrastructureService : IDisposable
             string.Equals(serverId, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(serverId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(serverId, SettingsStore.BuiltInUnrealId, StringComparison.OrdinalIgnoreCase))
             return;
 
@@ -607,6 +647,7 @@ public sealed class McpInfrastructureService : IDisposable
                 SettingsStore.BuiltInFilesystemId,
                 SettingsStore.BuiltInBinaryId,
                 SettingsStore.BuiltInHotplugControlId,
+                SettingsStore.BuiltInUnrealBuildId,
                 SettingsStore.BuiltInUnrealId,
                 "_shared"
             };
@@ -702,6 +743,7 @@ public sealed class McpInfrastructureService : IDisposable
                 dependencies,
                 _desiredRoots,
                 string.Equals(forceRetryServerId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase)).ConfigureAwait(false);
+            ReconcileUnrealBuildServer(string.Equals(forceRetryServerId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase));
             PublishCurrentSnapshot();
 
             // 3. Запускаем роутер (:8001) и открываем SSE-канал статусов
@@ -828,6 +870,7 @@ public sealed class McpInfrastructureService : IDisposable
                     routerDependencies,
                     _desiredRoots,
                     forceRestart: false).ConfigureAwait(false);
+                ReconcileUnrealBuildServer(forceRestart: false);
                 await ReconcileUnrealServerAsync().ConfigureAwait(false);
                 await ReconcileCustomServersAsync(
                     routerDependencies,
@@ -881,6 +924,11 @@ public sealed class McpInfrastructureService : IDisposable
                     await ReconcileBinaryServerAsync(dependencies, _desiredRoots, true).ConfigureAwait(false);
                     changed = true;
                 }
+            }
+            if (_unrealBuildEnabled && (_unrealBuildServer == null || !_unrealBuildServer.IsRunning))
+            {
+                ReconcileUnrealBuildServer(forceRestart: true);
+                changed = true;
             }
 
             foreach (var custom in _customServers.Where(server =>
@@ -2017,6 +2065,7 @@ public sealed class McpInfrastructureService : IDisposable
                     !string.Equals(existingStatusId, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase) &&
                     !string.Equals(existingStatusId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase) &&
                     !string.Equals(existingStatusId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(existingStatusId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase) &&
                     !desiredIds.Contains(existingStatusId))
                 {
                     _statusById.Remove(existingStatusId);
@@ -2553,6 +2602,22 @@ public sealed class McpInfrastructureService : IDisposable
             false,
             "local");
 
+        var ueBuildName = _unrealBuildCustom != null && !string.IsNullOrWhiteSpace(_unrealBuildCustom.Name)
+            ? _unrealBuildCustom.Name!
+            : "Unreal Build MCP";
+        if (!_unrealBuildEnabled)
+        {
+            AddUpstream(SettingsStore.BuiltInUnrealBuildId, ueBuildName, UnrealBuildEndpoint, null, "http", "unreal-build-mcp-v1", false, false, "local");
+        }
+        else if (_unrealBuildServer != null && _unrealBuildServer.IsRunning)
+        {
+            AddUpstream(SettingsStore.BuiltInUnrealBuildId, ueBuildName, UnrealBuildEndpoint, null, "http", "unreal-build-mcp-v1", true, false, "local");
+        }
+        else
+        {
+            AddUpstream(SettingsStore.BuiltInUnrealBuildId, ueBuildName, string.Empty, null, "http", "unreal-build-mcp-v1", true, true, "local");
+        }
+
         foreach (var configured in _customServers)
         {
             var isHttp = string.Equals(configured.Transport, "http", StringComparison.OrdinalIgnoreCase);
@@ -2926,7 +2991,8 @@ public sealed class McpInfrastructureService : IDisposable
                             IsBuiltIn = string.Equals(state.ServerId, SettingsStore.BuiltInUnrealId, StringComparison.OrdinalIgnoreCase) ||
                                 string.Equals(state.ServerId, SettingsStore.BuiltInFilesystemId, StringComparison.OrdinalIgnoreCase) ||
                                 string.Equals(state.ServerId, SettingsStore.BuiltInBinaryId, StringComparison.OrdinalIgnoreCase) ||
-                                string.Equals(state.ServerId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase)
+                                string.Equals(state.ServerId, SettingsStore.BuiltInHotplugControlId, StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(state.ServerId, SettingsStore.BuiltInUnrealBuildId, StringComparison.OrdinalIgnoreCase)
                         };
                         _statusById[state.ServerId] = status;
                     }
@@ -3254,6 +3320,85 @@ public sealed class McpInfrastructureService : IDisposable
             ErrorLog.Write("McpInfrastructureService.ReconcileBinaryServerAsync", ex);
             status.HealthState = McpServerHealthState.Quarantine;
             status.StatusText = I18n.Tr("Ошибка запуска Binary MCP: ", "Binary MCP startup error: ") + ex.Message;
+            status.ToolsCount = 0;
+        }
+    }
+
+    private int GetConfiguredUnrealMcpPort()
+    {
+        var url = (_unrealCustom != null && !string.IsNullOrWhiteSpace(_unrealCustom.Url))
+            ? _unrealCustom.Url!
+            : UnrealEndpoint;
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.IsLoopback && uri.Port > 0)
+            return uri.Port;
+        return 8000;
+    }
+
+    private void ReconcileUnrealBuildServer(bool forceRestart)
+    {
+        const string id = SettingsStore.BuiltInUnrealBuildId;
+        if (!_statusById.TryGetValue(id, out var status))
+        {
+            status = new ServerRuntimeStatus
+            {
+                Id = id,
+                Name = "Unreal Build MCP",
+                Subtitle = I18n.Tr("Сборка C++ (UBT) и перезапуск Unreal Editor", "C++ build (UBT) & Unreal Editor restart"),
+                IsBuiltIn = true,
+                TransportBadge = "BUILT-IN",
+                EndpointDisplay = "8006",
+                PathDisplay = "/mcp",
+                UpstreamUrl = UnrealBuildEndpoint
+            };
+            _statusById[id] = status;
+        }
+
+        status.Name = (_unrealBuildCustom != null && !string.IsNullOrWhiteSpace(_unrealBuildCustom.Name))
+            ? _unrealBuildCustom.Name!
+            : "Unreal Build MCP";
+        var desiredEnabled = IsDesiredEnabled(id, _unrealBuildEnabled);
+        status.IsEnabled = desiredEnabled;
+
+        if (!desiredEnabled)
+        {
+            if (_unrealBuildServer != null)
+            {
+                try { _unrealBuildServer.Dispose(); } catch { }
+                _unrealBuildServer = null;
+                ErrorLog.LogConnection(I18n.Tr("Unreal Build MCP (:8006) остановлен.", "Unreal Build MCP (:8006) stopped."));
+            }
+            ApplyDesiredEnabledToStatus(status, false);
+            return;
+        }
+
+        if (_unrealBuildServer != null && _unrealBuildServer.IsRunning && !forceRestart)
+            return;
+
+        if (_unrealBuildServer != null)
+        {
+            try { _unrealBuildServer.Dispose(); } catch { }
+            _unrealBuildServer = null;
+        }
+
+        try
+        {
+            EnsurePortAvailable(UnrealBuildPort, "Unreal Build MCP");
+            var server = new UnrealBuildMcpServer(UnrealBuildPort, GetConfiguredUnrealMcpPort);
+            server.Start();
+            _unrealBuildServer = server;
+            status.UpstreamUrl = UnrealBuildEndpoint;
+            if (status.HealthState == McpServerHealthState.Disabled || status.HealthState == McpServerHealthState.Quarantine)
+            {
+                status.HealthState = McpServerHealthState.Waiting;
+                status.StatusText = I18n.Tr("Ожидание проверки MCP endpoint…", "Waiting for MCP endpoint verification…");
+            }
+            ErrorLog.LogConnection(I18n.Tr("Unreal Build MCP (:8006) запущен.", "Unreal Build MCP (:8006) started."));
+        }
+        catch (Exception ex)
+        {
+            ErrorLog.Write("McpInfrastructureService.ReconcileUnrealBuildServer", ex);
+            status.HealthState = McpServerHealthState.Quarantine;
+            status.StatusText = I18n.Tr("Ошибка запуска Unreal Build MCP: ", "Unreal Build MCP startup error: ") + ex.Message;
             status.ToolsCount = 0;
         }
     }
@@ -4098,6 +4243,7 @@ public sealed class McpInfrastructureService : IDisposable
             if (_statusById.TryGetValue(SettingsStore.BuiltInFilesystemId, out var fs)) list.Add(fs);
             if (_statusById.TryGetValue(SettingsStore.BuiltInBinaryId, out var bin)) list.Add(bin);
             if (_statusById.TryGetValue(SettingsStore.BuiltInHotplugControlId, out var ctrl)) list.Add(ctrl);
+            if (_statusById.TryGetValue(SettingsStore.BuiltInUnrealBuildId, out var ueBuild)) list.Add(ueBuild);
             foreach (var custom in _customServers)
                 if (_statusById.TryGetValue(custom.Id, out var s)) list.Add(s);
             return list;
@@ -4240,6 +4386,11 @@ public sealed class McpInfrastructureService : IDisposable
         await StopChildAsync(_hotplugGateway).ConfigureAwait(false); _hotplugGateway = null;
         await StopChildAsync(_rootsFilter).ConfigureAwait(false); _rootsFilter = null;
         await StopChildAsync(_binaryMcp).ConfigureAwait(false); _binaryMcp = null;
+        if (_unrealBuildServer != null)
+        {
+            try { _unrealBuildServer.Dispose(); } catch { }
+            _unrealBuildServer = null;
+        }
         await StopChildAsync(_filesystemGateway).ConfigureAwait(false); _filesystemGateway = null;
         if (verifyPortRelease)
         {
@@ -4247,6 +4398,7 @@ public sealed class McpInfrastructureService : IDisposable
             await WaitForPortReleaseAsync(FilterPort, 3000).ConfigureAwait(false);
             await WaitForPortReleaseAsync(FilesystemPort, 3000).ConfigureAwait(false);
             await WaitForPortReleaseAsync(BinaryPort, 3000).ConfigureAwait(false);
+            await WaitForPortReleaseAsync(UnrealBuildPort, 3000).ConfigureAwait(false);
         }
         return new List<string>();
     }

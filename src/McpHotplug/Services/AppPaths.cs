@@ -104,6 +104,8 @@ public static class AppPaths
     public static string CompositeGatewayConfig => Path.Combine(ConfigDirectory, "composite-gateway.json");
     public static string RouterUpstreamsConfig => Path.Combine(ConfigDirectory, "router-upstreams.json");
     public static string BinaryRootsConfig => Path.Combine(ConfigDirectory, "binary-roots.json");
+    public static string UnrealBuildStateFile => Path.Combine(ConfigDirectory, "unreal-build-state.json");
+    public static string UnrealBuildLogsDirectory => Path.Combine(LogsDirectory, "UnrealBuilds");
     public static string EmptyFilesystemRootDirectory => Path.Combine(DependenciesDirectory, "EmptyFilesystemRoot");
     public static string ServerPackagesDirectory => Path.Combine(ConfigDirectory, "ServerPackages");
 

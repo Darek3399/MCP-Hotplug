@@ -14,7 +14,7 @@ namespace McpHotplug.Services;
 /// </summary>
 internal static class StaleManagedProcessCleaner
 {
-    private static readonly int[] CoreManagedPorts = { 8001, 8002, 8003, 8004, 8005 };
+    private static readonly int[] CoreManagedPorts = { 8001, 8002, 8003, 8004, 8005, 8006 };
 
     public static void CleanupKnownOrphans()
     {

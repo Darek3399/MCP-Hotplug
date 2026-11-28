@@ -2,10 +2,14 @@
 param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
-    [bool]$FastDependencyPackaging = $false
+    [bool]$FastDependencyPackaging = $false,
+    [bool]$TestBuild = $false
 )
 
 $ErrorActionPreference = 'Stop'
+if ($TestBuild) {
+    $FastDependencyPackaging = $true
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Join-Path $repoRoot 'Work'
@@ -53,7 +57,7 @@ if ($installerVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za
     throw "Некорректная версия продукта '$installerVersion' в '$versionPropsFile'. Ожидается SemVer вида 1.2.3 или 1.2.3-preview.1."
 }
 
-Write-Host "Версия MCP Hotplug: $installerVersion (Directory.Build.props)"
+Write-Host "Версия MCP Hotplug: $installerVersion$(if ($TestBuild) { ' [TEST BUILD]' } else { '' }) (Directory.Build.props)"
 
 if (-not (Test-Path -LiteralPath $publishScript -PathType Leaf)) {
     throw "Не найден сценарий публикации приложения: $publishScript"
@@ -77,7 +81,7 @@ if (-not $dotnet) {
     throw 'Команда dotnet не найдена. Установите .NET SDK.'
 }
 
-& $publishScript -Configuration $Configuration -LaunchAfterPublish $false
+& $publishScript -Configuration $Configuration -LaunchAfterPublish $false -TestBuild $TestBuild
 
 $updaterExecutable = Join-Path $publishDirectory 'MCPHotplug.Updater.exe'
 if (-not (Test-Path -LiteralPath $updaterExecutable -PathType Leaf)) {
@@ -112,8 +116,9 @@ foreach ($sourceAdapter in $sourceAdapters) {
 
 Write-Host "Проверка MCP-адаптеров пройдена: $($sourceAdapters.Count) файлов совпадают с исходниками."
 
-$installerOutput = Join-Path $installerDirectory "MCP-Hotplug-Setup-$installerVersion.exe"
-$compilerLog = Join-Path $diagnosticsDirectory 'inno-setup-build.log'
+$installerFileName = if ($TestBuild) { "MCP-Hotplug-Setup-$installerVersion-TEST.exe" } else { "MCP-Hotplug-Setup-$installerVersion.exe" }
+$installerOutput = Join-Path $installerDirectory $installerFileName
+$compilerLog = Join-Path $diagnosticsDirectory $(if ($TestBuild) { 'inno-setup-build-test.log' } else { 'inno-setup-build.log' })
 
 $embeddedPayloadRoots = @(
     $publishDirectory,
@@ -160,6 +165,10 @@ $compilerArguments = @(
     '/DFilesystemMcpPayload=1'
     ('/DAppVersion=' + $installerVersion)
 )
+if ($TestBuild) {
+    Write-Host 'ТЕСТОВАЯ СБОРКА УСТАНОВЩИКА: без сжатия, со всеми пометками TEST.' -ForegroundColor Red
+    $compilerArguments += '/DTestBuild=1'
+}
 if ($FastDependencyPackaging) {
     Write-Host 'Быстрый режим: зависимости добавляются в установщик без повторного сжатия.'
     $compilerArguments += '/DFastDependencyPackaging=1'

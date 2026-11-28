@@ -94,6 +94,13 @@ public sealed class AppSettings
 
     [DataMember(Order = 26, EmitDefaultValue = false)]
     public CustomMcpServerEntry? HotplugControlMcpCustom { get; set; }
+
+    /// <summary>Whether built-in Unreal Build MCP is enabled. Disabled by default.</summary>
+    [DataMember(Order = 27, EmitDefaultValue = false)]
+    public bool? UnrealBuildMcpEnabled { get; set; } = false;
+
+    [DataMember(Order = 28, EmitDefaultValue = false)]
+    public CustomMcpServerEntry? UnrealBuildMcpCustom { get; set; }
 }
 
 [DataContract]
@@ -348,7 +355,8 @@ public sealed class McpServerStatusSnapshot : INotifyPropertyChanged
     public System.Windows.Visibility DeleteButtonVisibility =>
         string.Equals(Id, "filesystem", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(Id, "binary", StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(Id, "hotplug_control", StringComparison.OrdinalIgnoreCase)
+        string.Equals(Id, "hotplug_control", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(Id, "unreal_build", StringComparison.OrdinalIgnoreCase)
             ? System.Windows.Visibility.Hidden
             : System.Windows.Visibility.Visible;
 

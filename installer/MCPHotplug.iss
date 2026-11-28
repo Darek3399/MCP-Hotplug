@@ -1,6 +1,15 @@
-#define AppName "MCP Hotplug"
 #ifndef AppVersion
   #error AppVersion must be supplied by Build-Installer.ps1 from Directory.Build.props
+#endif
+#ifdef TestBuild
+  #define AppName "MCP Hotplug [TEST]"
+  #define InstallerBaseName "MCP-Hotplug-Setup-" + AppVersion + "-TEST"
+  #ifndef FastDependencyPackaging
+    #define FastDependencyPackaging 1
+  #endif
+#else
+  #define AppName "MCP Hotplug"
+  #define InstallerBaseName "MCP-Hotplug-Setup-" + AppVersion
 #endif
 #define AppExeName "MCPHotplug.exe"
 #define PublishDir "..\Work\Build\publish\win-x64"
@@ -8,7 +17,11 @@
 [Setup]
 AppId={{17473ED1-A877-4A88-8485-A68A5DD8F646}
 AppName={#AppName}
+#ifdef TestBuild
+AppVersion={#AppVersion}-TEST
+#else
 AppVersion={#AppVersion}
+#endif
 AppPublisher=MCP Hotplug
 DefaultDirName={code:GetDefaultInstallDir}
 UsePreviousAppDir=yes
@@ -22,7 +35,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 OutputDir=..\Work\Build\installer
-OutputBaseFilename=MCP-Hotplug-Setup-{#AppVersion}
+OutputBaseFilename={#InstallerBaseName}
 #ifdef FastDependencyPackaging
 Compression=none
 SolidCompression=no
@@ -162,8 +175,8 @@ Root: HKCR; Subkey: "*\shell\tailscale"; ValueType: string; ValueName: "LegacyDi
 [Run]
 Filename: "{app}\{#AppExeName}"; Parameters: "--postinstall-launch"; Description: "{cm:LaunchApp}"; Flags: postinstall nowait skipifsilent runasoriginaluser
 [Icons]
-Name: "{group}\MCP Hotplug"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\Resources\MCPHotplug.ico"
-Name: "{autodesktop}\MCP Hotplug"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\Resources\MCPHotplug.ico"; Tasks: desktopicon
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\Resources\MCPHotplug.ico"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\Resources\MCPHotplug.ico"; Tasks: desktopicon
 
 [UninstallRun]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\Scripts\Stop-McpHotplugRuntime.ps1"" -AppDirectory ""{app}"" -Mode Uninstall"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StoppingApp}"; RunOnceId: "StopMCPHotplugRuntime"

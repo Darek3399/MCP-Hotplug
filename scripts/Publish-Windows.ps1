@@ -2,7 +2,8 @@
 param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
-    [bool]$LaunchAfterPublish = $true
+    [bool]$LaunchAfterPublish = $true,
+    [bool]$TestBuild = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -90,6 +91,7 @@ $diagnostics.Add("SDK version: $sdkVersion")
 $diagnostics.Add("SDK targets: $sdkSdksDirectory")
 $diagnostics.Add("Project: $project")
 $diagnostics.Add("Configuration: $Configuration")
+$diagnostics.Add("TestBuild: $TestBuild")
 $diagnostics.Add("Previous MSBuildSDKsPath: $(if ($previousMsBuildSDKsPath) { $previousMsBuildSDKsPath } else { '<not set>' })")
 $diagnostics.Add("Previous DOTNET_MSBUILD_SDK_RESOLVER_SDKS_DIR: $(if ($previousResolverSdk) { $previousResolverSdk } else { '<not set>' })")
 
@@ -105,7 +107,12 @@ try {
     }
 
     $outDirArgument = "-p:OutDir=$output/"
-    $buildOutput = & $dotnet.Source build $project --configuration $Configuration --nologo --verbosity minimal $outDirArgument '-p:PlatformTarget=x64' 2>&1
+    $buildArgs = @('build', $project, '--configuration', $Configuration, '--nologo', '--verbosity', 'minimal', $outDirArgument, '-p:PlatformTarget=x64')
+    if ($TestBuild) {
+        Write-Host '================ TEST BUILD (НЕ ДЛЯ РЕЛИЗА) ================' -ForegroundColor Red
+        $buildArgs += '-p:TestBuild=true'
+    }
+    $buildOutput = & $dotnet.Source @buildArgs 2>&1
     $buildExitCode = $LASTEXITCODE
     $diagnostics.Add("Build exit code: $buildExitCode")
     if ($buildExitCode -ne 0) {
